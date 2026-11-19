@@ -33,7 +33,7 @@
 [hidden] { display: none !important; }
 html, body { margin: 0; background: var(--bg); color: var(--ink); }
 body { font: 15px/1.5 var(--font); }
-main { max-width: 680px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
+main { max-width: 1180px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
 h1 { font-size: 22px; line-height: 1.2; margin: 6px 0 4px; text-wrap: balance; }
 h2 { font-size: 16px; margin: 0; }
 h3 { font-size: 14px; margin: 0; }
@@ -61,6 +61,46 @@ input[type="checkbox"] { accent-color: var(--accent); width: 18px; height: 18px;
 .seg { display: flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
 .seg button { flex: 1; border: 0; background: transparent; box-shadow: none; }
 .seg button[aria-pressed="true"] { background: var(--surface); box-shadow: 0 1px 2px rgba(0,0,0,.15); font-weight: 600; }
+
+/* Cámara y ajustes: apilados en móvil vertical, lado a lado en pantallas anchas o en horizontal */
+.workspace { display: grid; gap: 14px; align-items: start; }
+.side { display: grid; gap: 14px; align-content: start; min-width: 0; }
+.viewcol { min-width: 0; }
+.controls button { flex: 0 1 auto; }
+@media (min-width: 880px), (orientation: landscape) and (min-width: 560px) {
+  .workspace { grid-template-columns: minmax(0, 1fr) clamp(260px, 34vw, 380px); }
+  .side { position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow-y: auto; overscroll-behavior: contain; padding-right: 2px; }
+}
+.workspace.nopanel { grid-template-columns: minmax(0, 1fr); }
+.workspace.nopanel .side { display: none; }
+
+/* Pantalla completa: el video ocupa todo el alto y los ajustes quedan en una columna lateral */
+body.noscroll { overflow: hidden; }
+.workspace.fs {
+  position: fixed; inset: 0; z-index: 100; margin: 0; gap: 0;
+  grid-template-columns: minmax(0, 1fr) clamp(250px, 30vw, 360px);
+  grid-template-rows: 100%; height: 100%; background: var(--bg);
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.workspace.fs.nopanel { grid-template-columns: minmax(0, 1fr); }
+.fs .viewcol { border: 0; border-radius: 0; padding: 8px; height: 100%; display: flex; flex-direction: column; gap: 6px; background: var(--bg); }
+.fs .viewcol > .row.between { display: none; }
+.fs .stagewrap { flex: 1; min-height: 0; container-type: size; display: grid; place-items: center; }
+.fs .stage { width: min(100cqw, calc(100cqh * var(--ar))); margin: 0; }
+.fs .controls { gap: 6px; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+.fs .controls button { flex: 0 0 auto; }
+.fs .controls button { padding: 6px 10px; font-size: 13px; }
+.fs #status { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fs .side { position: static; max-height: none; height: 100%; overflow-y: auto; padding: 8px; border-left: 1px solid var(--line); }
+.fs .side .card { padding: 10px; gap: 10px; }
+@media (orientation: portrait) {
+  .workspace.fs { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1.3fr) minmax(0, 1fr); }
+  .workspace.fs.nopanel { grid-template-rows: 100%; }
+  .fs .side { border-left: 0; border-top: 1px solid var(--line); }
+}
+.badge { position: absolute; top: 8px; right: 8px; padding: 4px 10px; border-radius: 8px; background: rgba(0,0,0,.62); color: #fff; font-size: 26px; font-weight: 600; line-height: 1.15; pointer-events: none; }
+.badge small { display: block; font-size: 11px; font-weight: 500; opacity: .85; }
+.badge.over { background: rgba(180,35,44,.88); }
 
 .stage { --ar: 1.7778; position: relative; width: min(100%, calc(62vh * var(--ar))); margin: 0 auto; aspect-ratio: 16 / 9; background: #000; border-radius: 10px; overflow: hidden; }
 .stage video, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
@@ -97,54 +137,30 @@ details ul, details ol { margin: 10px 0 0; padding-left: 20px; color: var(--mute
     <p class="lede">Detecta los vehículos en vivo, sigue su contacto con la calzada, calcula la velocidad y la anota con fecha y hora. El registro se exporta como CSV.</p>
   </header>
 
-  <section class="card" aria-labelledby="hCam">
-    <div class="row between">
-      <h2 id="hCam">Cámara</h2>
-      <span class="hint mono" id="fpsLbl"></span>
-    </div>
-    <div class="stage" id="stage">
-      <video id="video" playsinline muted></video>
-      <canvas id="overlay" aria-label="Detecciones y calibración sobre la imagen"></canvas>
-      <div class="placeholder" id="placeholder">Cámara apagada. Pon el celular fijo y pulsa «Iniciar cámara».</div>
-    </div>
-    <div class="row">
-      <button class="primary" id="startBtn">Iniciar cámara</button>
-      <button id="stopBtn" disabled>Detener</button>
-      <button id="bgBtn" disabled>Reaprender fondo</button>
-    </div>
-    <p class="hint" id="status">Listo.</p>
-  </section>
-
-  <section class="card" aria-label="Última lectura">
-    <div class="reading" aria-live="polite">
-      <span class="big mono" id="speed">--</span><span class="unit">km/h</span>
-      <span class="hint" id="lastInfo">Esperando el primer vehículo.</span>
-    </div>
-    <div class="stats">
-      <div class="stat"><span>Vehículos</span><span class="mono" id="stN">0</span></div>
-      <div class="stat"><span>Promedio</span><span class="mono" id="stAvg">–</span></div>
-      <div class="stat"><span>Sobre el límite</span><span class="mono" id="stOver">0</span></div>
-    </div>
-  </section>
-
-  <section class="card" aria-labelledby="hLog">
-    <div class="row between">
-      <h2 id="hLog">Registro</h2>
-      <div class="row">
-        <button class="primary" id="csvBtn">Exportar CSV</button>
-        <button id="clearLog">Borrar</button>
+  <section class="workspace" id="workspace" aria-label="Cámara y ajustes">
+    <div class="card viewcol" aria-labelledby="hCam">
+      <div class="row between">
+        <h2 id="hCam">Cámara</h2>
+        <span class="hint mono" id="fpsLbl"></span>
       </div>
+      <div class="stagewrap">
+        <div class="stage" id="stage">
+          <video id="video" playsinline muted></video>
+          <canvas id="overlay" aria-label="Detecciones y calibración sobre la imagen"></canvas>
+          <div class="placeholder" id="placeholder">Cámara apagada. Pon el celular fijo y pulsa «Iniciar cámara».</div>
+          <div class="badge mono" id="badge" hidden></div>
+        </div>
+      </div>
+      <div class="row controls">
+        <button class="primary" id="startBtn">Iniciar cámara</button>
+        <button id="stopBtn" disabled>Detener</button>
+        <button id="bgBtn" disabled>Reaprender fondo</button>
+        <button id="fsBtn">Pantalla completa</button>
+        <button id="panelBtn" aria-pressed="false">Ocultar ajustes</button>
+      </div>
+      <p class="hint" id="status">Listo.</p>
     </div>
-    <div class="tablewrap">
-      <table>
-        <thead><tr><th class="l">Fecha</th><th class="l">Hora</th><th>km/h</th><th class="l">Sentido</th><th>Muestras</th><th>Recorrido (m)</th><th>R²</th></tr></thead>
-        <tbody id="logBody"></tbody>
-      </table>
-    </div>
-    <p class="hint" id="logEmpty">Sin registros todavía. El registro se guarda en este navegador aunque cierres la página.</p>
-    <p class="hint" id="csvMsg"></p>
-  </section>
-
+    <aside class="side" id="side" aria-label="Ajustes">
   <section class="card" aria-labelledby="hCal">
     <h2 id="hCal">Calibración</h2>
     <div class="seg" role="group" aria-label="Método de calibración">
@@ -227,6 +243,39 @@ details ul, details ol { margin: 10px 0 0; padding-left: 20px; color: var(--mute
     <label class="check"><input type="checkbox" id="shadows" checked> Ignorar sombras</label>
     <label class="check"><input type="checkbox" id="showMask"> Mostrar píxeles detectados</label>
     <p class="hint">Si aparecen detecciones sin vehículos, sube la sensibilidad o el tamaño mínimo. Si un vehículo no se detecta, bájalos.</p>
+  </section>
+
+    </aside>
+  </section>
+
+  <section class="card" aria-label="Última lectura">
+    <div class="reading" aria-live="polite">
+      <span class="big mono" id="speed">--</span><span class="unit">km/h</span>
+      <span class="hint" id="lastInfo">Esperando el primer vehículo.</span>
+    </div>
+    <div class="stats">
+      <div class="stat"><span>Vehículos</span><span class="mono" id="stN">0</span></div>
+      <div class="stat"><span>Promedio</span><span class="mono" id="stAvg">–</span></div>
+      <div class="stat"><span>Sobre el límite</span><span class="mono" id="stOver">0</span></div>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="hLog">
+    <div class="row between">
+      <h2 id="hLog">Registro</h2>
+      <div class="row">
+        <button class="primary" id="csvBtn">Exportar CSV</button>
+        <button id="clearLog">Borrar</button>
+      </div>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th class="l">Fecha</th><th class="l">Hora</th><th>km/h</th><th class="l">Sentido</th><th>Muestras</th><th>Recorrido (m)</th><th>R²</th></tr></thead>
+        <tbody id="logBody"></tbody>
+      </table>
+    </div>
+    <p class="hint" id="logEmpty">Sin registros todavía. El registro se guarda en este navegador aunque cierres la página.</p>
+    <p class="hint" id="csvMsg"></p>
   </section>
 
   <details>
@@ -893,6 +942,13 @@ function renderLog(fresh) {
   $('speed').textContent = last ? nf(last.v, 0) : '--';
   $('speed').classList.toggle('over', !!last && limit > 0 && last.v > limit);
   $('lastInfo').textContent = last ? `${last.hora} · sentido ${last.dir} · ${last.n} muestras` : 'Esperando el primer vehículo.';
+  const badge = $('badge');
+  badge.hidden = !last;
+  if (last) {
+    badge.replaceChildren(document.createTextNode(`${nf(last.v, 0)} km/h`));
+    const sm = document.createElement('small'); sm.textContent = `${last.hora} · ${last.dir}`; badge.append(sm);
+    badge.classList.toggle('over', limit > 0 && last.v > limit);
+  }
   $('stN').textContent = String(L.length);
   $('stAvg').textContent = L.length ? `${nf(L.reduce((a, r) => a + r.v, 0) / L.length, 0)} km/h` : '–';
   $('stOver').textContent = String(limit > 0 ? L.filter((r) => r.v > limit).length : 0);
@@ -978,6 +1034,45 @@ document.querySelectorAll('input, select').forEach((el) => el.addEventListener('
   else if (el.id === 'limit') renderLog();
   else drawOverlay();
 }));
+
+// ================= Pantalla completa y panel lateral =================
+const ws = $('workspace');
+function fsElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
+function setFs(on) {
+  ws.classList.toggle('fs', on);
+  document.body.classList.toggle('noscroll', on);
+  $('fsBtn').textContent = on ? 'Salir de pantalla completa' : 'Pantalla completa';
+  requestAnimationFrame(resizeOverlay);
+}
+function enterFs() {
+  setFs(true);
+  const req = ws.requestFullscreen || ws.webkitRequestFullscreen;
+  if (!req) return;   // iPhone: se usa el modo de pantalla completa de la página
+  try {
+    const r = req.call(ws, { navigationUI: 'hide' });
+    const lock = () => { try { screen.orientation.lock('landscape').catch(() => {}); } catch (e) { /* no disponible */ } };
+    if (r && r.then) r.then(lock, () => {}); else lock();
+  } catch (e) { /* el navegador no lo permite: queda el modo de la página */ }
+}
+function exitFs() {
+  if (fsElement()) { try { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) { /* ya salió */ } }
+  try { screen.orientation.unlock(); } catch (e) { /* no disponible */ }
+  setFs(false);
+}
+$('fsBtn').addEventListener('click', () => ws.classList.contains('fs') ? exitFs() : enterFs());
+const onFsChange = () => { if (!fsElement() && ws.classList.contains('fs')) setFs(false); };
+document.addEventListener('fullscreenchange', onFsChange);
+document.addEventListener('webkitfullscreenchange', onFsChange);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && ws.classList.contains('fs') && !fsElement()) setFs(false); });
+function setPanel(show) {
+  ws.classList.toggle('nopanel', !show);
+  $('panelBtn').textContent = show ? 'Ocultar ajustes' : 'Mostrar ajustes';
+  $('panelBtn').setAttribute('aria-pressed', String(!show));
+  try { localStorage.setItem('velocimetro.panel.v1', show ? '1' : '0'); } catch (e) { /* sin almacenamiento */ }
+  requestAnimationFrame(resizeOverlay);
+}
+$('panelBtn').addEventListener('click', () => setPanel(ws.classList.contains('nopanel')));
+try { if (localStorage.getItem('velocimetro.panel.v1') === '0') setPanel(false); } catch (e) { /* sin almacenamiento */ }
 
 loadSaved();
 updateFocalFields();
