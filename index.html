@@ -245,6 +245,14 @@ details ul, details ol { margin: 10px 0 0; padding-left: 20px; color: var(--mute
       <label>Velocidad máxima (km/h)<input id="vMax" type="number" step="any" value="180" inputmode="decimal"></label>
       <label>Límite de velocidad (km/h)<input id="limit" type="number" step="any" value="50" inputmode="decimal"></label>
     </div>
+    <label>Resolución de análisis
+      <select id="res">
+        <option value="auto">Automática (baja si el celular va lento)</option>
+        <option value="480">Alta (480 px)</option>
+        <option value="400">Media (400 px)</option>
+        <option value="320">Baja (320 px, menos precisa en el carril lejano)</option>
+      </select>
+    </label>
     <label class="check"><input type="checkbox" id="shadows" checked> Ignorar sombras</label>
     <label class="check"><input type="checkbox" id="showMask"> Mostrar píxeles detectados</label>
     <p class="hint">Si aparecen detecciones sin vehículos, sube la sensibilidad o el tamaño mínimo. Si un vehículo no se detecta, bájalos.</p>
@@ -310,12 +318,25 @@ const video = $('video'), ov = $('overlay'), stage = $('stage');
 const octx = ov.getContext('2d');
 const STORE_SET = 'velocimetro.ajustes.v1', STORE_LOG = 'velocimetro.registro.v1';
 
-const PW = 480;                         // ancho de procesamiento
+let PW = 480;                           // ancho de procesamiento (baja si el celular no alcanza)
+const LEVELS = [480, 400, 320];
 const proc = document.createElement('canvas');
 const pctx = proc.getContext('2d', { willReadFrequently: true });
-const SW = 240;                         // ancho para medir el movimiento de la cámara
-const scv = document.createElement('canvas');
-const sctx = scv.getContext('2d', { willReadFrequently: true });
+const stc = document.createElement('canvas');   // capa fija: cuadrícula, zona, puntos de calibración
+const sctx = stc.getContext('2d');
+// Desenfoque en la tarjeta gráfica si el navegador lo hace bien (Chrome); si no, en JavaScript
+const GPU_BLUR = (() => {
+  try {
+    const a = document.createElement('canvas'); a.width = 9; a.height = 1;
+    const ax = a.getContext('2d', { willReadFrequently: true }); ax.filter = 'blur(1px)';
+    if (ax.filter !== 'blur(1px)') return false;
+    const b = document.createElement('canvas'); b.width = 9; b.height = 1;
+    const bx = b.getContext('2d'); bx.fillStyle = '#fff'; bx.fillRect(4, 0, 1, 1);
+    ax.drawImage(b, 0, 0);
+    const d = ax.getImageData(0, 0, 9, 1).data;
+    return d[3 * 4 + 3] > 0 && d[4 * 4 + 3] < 255;
+  } catch (e) { return false; }
+})();
 
 const S = {
   stream: null, running: false, srcW: 1280, srcH: 720, PH: 180,
@@ -323,9 +344,10 @@ const S = {
   bg: null, fg: null, tmp: null, lab: null, stack: null, warm: 0, fastLearn: 0, maskImg: null,
   tracks: [], nextId: 1, dets: [], log: [], wallOffset: 0,
   frames: 0, fpsT0: 0, wakeLock: null,
-  // Estabilización: desplazamiento de la imagen actual respecto a la de referencia
-  stab: { ref: null, SH: 135, dx: 0, dy: 0, M: 38, My: 22, y0: null, ax: true, ay: true }, offX: 0, offY: 0,
-  valid: null, bl: null, bl2: null, gray: null, prevGray: null, prevT: 0, lastWarn: 0, D: null,
+  // Estabilización: desplazamiento (fracción del ancho y del alto) de la imagen actual respecto a la de referencia
+  offX: 0, offY: 0, ref2: null, g2: null, prevG2: null, ax: true, ay: true, resX: 0, prevResX: 0, stabY0: null,
+  valid: null, bl: null, bl2: null, gray: null, prevGray: null, prevT: 0, lastWarn: 0, D: null, idx: null,
+  ema: 0, levelFrames: 0, lastPF: -1, calVer: 0, staticKey: '',
 };
 
 const num = (id) => { const v = parseFloat(String($(id).value).replace(',', '.')); return Number.isFinite(v) ? v : NaN; };
@@ -437,7 +459,8 @@ let CAL = { error: 'Sin calibrar.' };
 function rebuildCal() {
   CAL = S.calMode === 'geo' ? geoCal() : refCal();
   S.tracks = [];
-  S.stab.y0 = stabRowStart();
+  S.stabY0 = stabRowStart();
+  S.calVer++;
   $('calInfo').textContent = CAL.error || (S.calMode === 'geo'
     ? `Calibración lista. Focal ${nf(CAL.f, 0)} px.`
     : 'Calibración lista. La cuadrícula debe coincidir con las líneas de la vía.');
@@ -452,76 +475,75 @@ function allocate() {
   proc.width = PW; proc.height = S.PH;
   const n = PW * S.PH;
   S.bg = new Float32Array(n * 3); S.fg = new Uint8Array(n); S.tmp = new Uint8Array(n);
-  S.lab = new Int32Array(n); S.stack = new Int32Array(n);
+  S.lab = new Int32Array(n); S.stack = new Int32Array(n); S.idx = new Int32Array(n);
   S.maskImg = new ImageData(PW, S.PH);
   S.bl = new Float32Array(n * 3); S.bl2 = new Float32Array(n * 3);
   S.gray = new Float32Array(n); S.prevGray = new Float32Array(n);
-  S.warm = 0;
-  const st = S.stab;
-  st.SH = Math.max(2, Math.round(SW * S.srcH / S.srcW));
-  scv.width = SW; scv.height = st.SH;
-  st.ref = null; st.dx = 0; st.dy = 0; st.M = Math.round(SW * 0.16); st.My = Math.round(st.SH * 0.16);
   S.D = new Float32Array(n);
-  S.offX = 0; S.offY = 0; S.valid = null;
+  const n2 = (PW >> 1) * (S.PH >> 1);
+  S.g2 = new Float32Array(n2); S.prevG2 = new Float32Array(n2);
+  S.ref2 = null; S.resX = 0; S.prevResX = 0;
+  S.warm = 0; S.valid = null; S.tracks = []; S.prevT = 0; S.ema = 0; S.levelFrames = 0;
+}
+function resetStab() { S.offX = 0; S.offY = 0; S.ref2 = null; S.resX = 0; S.prevResX = 0; }
+function setLevel(w, why) {
+  if (w === PW) return;
+  PW = w; allocate();
+  if (why) setStatus(why);
 }
 
 // ================= Estabilización =================
-// El celular en la mano o un trípode que vibra mueven la imagen. Se mide el desplazamiento de cada
-// fotograma respecto al primero en la franja de suelo más cercana que la vía (andén), que no tiene tránsito,
-// y se corrige antes de detectar. Así la calibración sigue valiendo aunque la cámara se mueva un poco.
+// El celular en la mano o un trípode que vibra mueven la imagen. Cada cuadro se dibuja corrido según el
+// movimiento acumulado; luego se mide el desfase que queda frente a la imagen de referencia, en la franja de
+// suelo más cercana que la vía (andén), y se corrige para el cuadro siguiente. Una sola lectura por cuadro.
 function stabRowStart() {
-  if (CAL.error || !S.stab.SH) return null;
+  if (CAL.error) return null;
   const z = CAL.zone, mx = (Math.max(z.x0, -20) + Math.min(z.x1, 20)) / 2;
   let vmax = -1;
   for (const Y of [z.y0, z.y1]) { const p = CAL.toImage(mx, Y); if (p && p[1] > vmax) vmax = p[1]; }
-  if (vmax < 0) return null;
-  return Math.round(vmax * S.stab.SH / S.srcH) + 2;   // se usa solo si deja al menos 15 % de la altura
+  return vmax < 0 ? null : vmax / S.srcH;          // fracción de la altura
 }
-function stabUpdate() {
-  const st = S.stab, SH = st.SH, M = st.M, My = st.My;
-  const y0 = st.y0 != null && SH - My - st.y0 >= 0.15 * SH ? st.y0 : My;
-  sctx.drawImage(video, 0, 0, SW, SH);
-  const d = sctx.getImageData(0, 0, SW, SH).data;
-  const g = new Float32Array(SW * SH);
-  for (let i = 0, p = 0; i < g.length; i++, p += 4) g[i] = d[p] * 0.3 + d[p + 1] * 0.59 + d[p + 2] * 0.11;
-  if (!st.ref) {
-    st.ref = g; st.dx = 0; st.dy = 0;
+function stabResidual() {
+  const W2 = PW >> 1, H2 = S.PH >> 1, g = S.g2, gr = S.gray, W = PW;
+  for (let y = 0; y < H2; y++) for (let x = 0; x < W2; x++) {
+    const i = 2 * y * W + 2 * x;
+    g[y * W2 + x] = (gr[i] + gr[i + 1] + gr[i + W] + gr[i + W + 1]) * 0.25;
+  }
+  const M = 6;
+  let y0 = S.stabY0 != null ? Math.round(S.stabY0 * H2) + 2 : M;
+  if (H2 - M - y0 < 0.15 * H2) y0 = M;
+  if (!S.ref2) {
+    S.ref2 = g.slice();
     // Solo se corrige el eje en el que el suelo tiene textura (en un piso liso la medida sería ruido)
     let gx = 0, gy = 0, n = 0;
-    for (let y = y0; y < SH - My - 1; y++) for (let x = M; x < SW - M - 1; x++) {
-      const i = y * SW + x; gx += Math.abs(g[i + 1] - g[i]); gy += Math.abs(g[i + SW] - g[i]); n++;
+    for (let y = y0; y < H2 - M - 1; y++) for (let x = M; x < W2 - M - 1; x++) {
+      const i = y * W2 + x; gx += Math.abs(g[i + 1] - g[i]); gy += Math.abs(g[i + W2] - g[i]); n++;
     }
-    st.ax = n > 0 && gx / n >= 1.5; st.ay = n > 0 && gy / n >= 1.5;
-    return;
+    S.ax = n > 0 && gx / n >= 1.2; S.ay = n > 0 && gy / n >= 1.2;
+    return [0, 0];
   }
-  const ref = st.ref, C = new Map();
-  const cost = (ox, oy) => {
-    let sum = 0, n = 0;
-    for (let y = y0; y < SH - My; y += 2) {
-      const o = y * SW, o2 = (y + oy) * SW + ox;
-      for (let x = M; x < SW - M; x += 2) { const e = Math.abs(ref[o + x] - g[o2 + x]); sum += e < 25 ? e : 25; n++; }
-    }
-    return n ? sum / n : Infinity;
-  };
-  const cx = Math.round(st.dx), cy = Math.round(st.dy), lim = M - 2, limY = My - 2;
-  let best = Infinity, bx = cx, by = cy;
-  for (let oy = st.ay ? cy - 3 : 0; oy <= (st.ay ? cy + 3 : 0); oy++) {
-    for (let ox = st.ax ? cx - 3 : 0; ox <= (st.ax ? cx + 3 : 0); ox++) {
-      if (Math.abs(ox) > lim || Math.abs(oy) > limY) continue;
-      const c = cost(ox, oy); C.set(ox + ',' + oy, c);
+  const ref = S.ref2, R = 3, C = new Float64Array(49).fill(Infinity);
+  let best = Infinity, bx = 0, by = 0;
+  for (let oy = -R; oy <= R; oy++) {
+    if (!S.ay && oy) continue;
+    for (let ox = -R; ox <= R; ox++) {
+      if (!S.ax && ox) continue;
+      let sum = 0, n = 0;
+      for (let y = y0; y < H2 - M; y++) {
+        const o = y * W2, o2 = (y + oy) * W2 + ox;
+        for (let x = M; x < W2 - M; x += 2) { const e = Math.abs(ref[o + x] - g[o2 + x]); sum += e < 25 ? e : 25; n++; }
+      }
+      const c = n ? sum / n : Infinity; C[(oy + R) * 7 + ox + R] = c;
       if (c < best) { best = c; bx = ox; by = oy; }
     }
   }
+  const gc = (x, y) => (Math.abs(x) <= R && Math.abs(y) <= R && Number.isFinite(C[(y + R) * 7 + x + R])) ? C[(y + R) * 7 + x + R] : best;
   const sub = (a, b, c) => { const dd = a - 2 * b + c; return dd > 1e-6 ? Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / dd)) : 0; };
-  const gc = (x, y) => C.get(x + ',' + y) ?? best;
-  st.dx = st.ax ? bx + sub(gc(bx - 1, by), best, gc(bx + 1, by)) : 0;
-  st.dy = st.ay ? by + sub(gc(bx, by - 1), best, gc(bx, by + 1)) : 0;
-  if ((Math.abs(st.dx) > lim - 2 || Math.abs(st.dy) > limY - 2) && performance.now() - S.lastWarn > 4000) {
-    S.lastWarn = performance.now();
-    setStatus('La cámara se movió demasiado. Fíjala, pulsa «Detener» e «Iniciar cámara», y revisa la calibración.');
-  }
+  const rx = S.ax ? bx + sub(gc(bx - 1, by), best, gc(bx + 1, by)) : 0;
+  const ry = S.ay ? by + sub(gc(bx, by - 1), best, gc(bx, by + 1)) : 0;
+  return [rx * 2, ry * 2];                       // en píxeles de procesamiento
 }
-// Gaussiano de radio 2 (σ≈1 px): reduce el parpadeo de texturas finas, como rejas, por movimientos menores de un píxel
+// Gaussiano de radio 2 (σ≈1 px) en JavaScript, para navegadores sin desenfoque en el lienzo
 function blur3(d) {
   const W = PW, H = S.PH, a = S.bl2, b = S.bl;
   for (let y = 0; y < H; y++) {
@@ -542,40 +564,39 @@ function blur3(d) {
       }
     }
   }
-  return b;
 }
-function passH(src, dst, dil) {
-  const W = PW, H = S.PH;
+// Erosión o dilatación con un cuadrado de radio r, con sumas corridas (cuesta lo mismo para cualquier r)
+function morph(a, r, dil) {
+  const W = PW, H = S.PH, t = S.tmp, need = dil ? 1 : 2 * r + 1;
   for (let y = 0; y < H; y++) {
-    const o = y * W;
+    const o = y * W; let sum = 0;
+    for (let x = 0; x < r && x < W; x++) sum += a[o + x];
     for (let x = 0; x < W; x++) {
-      const a = x > 0 ? src[o + x - 1] : 0, b = src[o + x], c = x < W - 1 ? src[o + x + 1] : 0;
-      dst[o + x] = dil ? (a | b | c) : (a & b & c);
+      if (x + r < W) sum += a[o + x + r];
+      if (x - r - 1 >= 0) sum -= a[o + x - r - 1];
+      t[o + x] = sum >= need ? 1 : 0;
+    }
+  }
+  for (let x = 0; x < W; x++) {
+    let sum = 0;
+    for (let y = 0; y < r && y < H; y++) sum += t[y * W + x];
+    for (let y = 0; y < H; y++) {
+      if (y + r < H) sum += t[(y + r) * W + x];
+      if (y - r - 1 >= 0) sum -= t[(y - r - 1) * W + x];
+      a[y * W + x] = sum >= need ? 1 : 0;
     }
   }
 }
-function passV(src, dst, dil) {
-  const W = PW, H = S.PH;
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const i = y * W + x;
-      const a = y > 0 ? src[i - W] : 0, b = src[i], c = y < H - 1 ? src[i + W] : 0;
-      dst[i] = dil ? (a | b | c) : (a & b & c);
-    }
-  }
-}
-const erode = (a) => { passH(a, S.tmp, false); passV(S.tmp, a, false); };
-const dilate = (a) => { passH(a, S.tmp, true); passV(S.tmp, a, true); };
 
-function segment(raw) {
-  const n = PW * S.PH, bg = S.bg, fg = S.fg, d = blur3(raw), V = S.valid;
-  const inside = (i) => { const x = i % PW, y = (i / PW) | 0; return x >= V.x0 && x <= V.x1 && y >= V.y0 && y <= V.y1; };
+function segment() {
+  const n = PW * S.PH, bg = S.bg, fg = S.fg, d = S.bl, V = S.valid, D = S.D, W = PW;
   if (S.warm < 15) {
-    // Primeros fotogramas: promedio rápido del fondo, sin detecciones
+    // Primeros cuadros: promedio rápido del fondo, sin detecciones
     const k = S.warm === 0 ? 1 : 0.3;
-    for (let i = 0, q = 0; i < n; i++, q += 3) {
-      if (S.warm > 0 && !inside(i)) continue;
-      bg[q] += (d[q] - bg[q]) * k; bg[q + 1] += (d[q + 1] - bg[q + 1]) * k; bg[q + 2] += (d[q + 2] - bg[q + 2]) * k;
+    for (let y = S.warm ? V.y0 : 0; y <= (S.warm ? V.y1 : S.PH - 1); y++) {
+      for (let x = S.warm ? V.x0 : 0, q = (y * W + x) * 3; x <= (S.warm ? V.x1 : W - 1); x++, q += 3) {
+        bg[q] += (d[q] - bg[q]) * k; bg[q + 1] += (d[q + 1] - bg[q + 1]) * k; bg[q + 2] += (d[q + 2] - bg[q + 2]) * k;
+      }
     }
     S.warm++;
     fg.fill(0);
@@ -584,27 +605,30 @@ function segment(raw) {
   const thr = (num('thr') > 0 ? num('thr') : 28) * 3, shadows = $('shadows').checked;
   // Bajo un vehículo el fondo se actualiza despacio (kf), pero no tanto como para dejar fantasmas largos
   const kb = S.fastLearn > 0 ? 0.25 : 0.03, kf = S.fastLearn > 0 ? 0.25 : 0.02;
+  fg.fill(0); D.fill(0);
   let count = 0;
-  for (let i = 0, q = 0; i < n; i++, q += 3) {
-    if (!inside(i)) { fg[i] = 0; S.D[i] = 0; continue; }
-    const r = d[q], g = d[q + 1], b = d[q + 2], br = bg[q], bgg = bg[q + 1], bb = bg[q + 2];
-    S.D[i] = Math.abs(0.3 * (r - br) + 0.59 * (g - bgg) + 0.11 * (b - bb));
-    let f = (Math.abs(r - br) + Math.abs(g - bgg) + Math.abs(b - bb)) > thr ? 1 : 0;
-    if (f && shadows) {
-      const I = r + g + b + 3, B = br + bgg + bb + 3, ratio = I / B;
-      if (ratio > 0.35 && ratio < 0.95) {
-        const dc = Math.abs((r + 1) / I - (br + 1) / B) + Math.abs((g + 1) / I - (bgg + 1) / B) + Math.abs((b + 1) / I - (bb + 1) / B);
-        if (dc < 0.05) f = 0;   // más oscuro, mismo color: sombra
+  for (let y = V.y0; y <= V.y1; y++) {
+    for (let x = V.x0, i = y * W + x, q = i * 3; x <= V.x1; x++, i++, q += 3) {
+      const r = d[q], g = d[q + 1], b = d[q + 2], br = bg[q], bgg = bg[q + 1], bb = bg[q + 2];
+      const dr = r - br, dg = g - bgg, db = b - bb;
+      D[i] = Math.abs(0.3 * dr + 0.59 * dg + 0.11 * db);
+      let f = (Math.abs(dr) + Math.abs(dg) + Math.abs(db)) > thr ? 1 : 0;
+      if (f && shadows) {
+        const I = r + g + b + 3, B = br + bgg + bb + 3, ratio = I / B;
+        if (ratio > 0.35 && ratio < 0.95) {
+          const dc = Math.abs((r + 1) / I - (br + 1) / B) + Math.abs((g + 1) / I - (bgg + 1) / B) + Math.abs((b + 1) / I - (bb + 1) / B);
+          if (dc < 0.05) f = 0;   // más oscuro, mismo color: sombra
+        }
       }
+      fg[i] = f; count += f;
+      const k = f ? kf : kb;
+      bg[q] = br + dr * k; bg[q + 1] = bgg + dg * k; bg[q + 2] = bb + db * k;
     }
-    fg[i] = f; count += f;
-    const k = f ? kf : kb;
-    bg[q] = br + (r - br) * k; bg[q + 1] = bgg + (g - bgg) * k; bg[q + 2] = bb + (b - bb) * k;
   }
   if (S.fastLearn > 0) S.fastLearn--;
   const frac = count / n;
   if (frac > 0.45) { S.fastLearn = 10; fg.fill(0); return frac; }  // cambio global de luz
-  erode(fg); dilate(fg); dilate(fg); dilate(fg); erode(fg); erode(fg);
+  morph(fg, 1, false); morph(fg, 3, true); morph(fg, 2, false);
   return frac;
 }
 
@@ -677,35 +701,33 @@ function inZone(w) {
 // Desplazamiento horizontal (px de procesamiento) del vehículo entre el fotograma anterior y el actual.
 // Compara solo los píxeles del vehículo en la mitad inferior; no depende de cómo crece o se parte la mancha.
 function corrShift(c, pred, dtf) {
-  const W = PW, lab = S.lab, cur = S.gray, prev = S.prevGray;
+  const W = PW, lab = S.lab, cur = S.gray, prev = S.prevGray, idx = S.idx;
   const ym = c.y0 + Math.floor((c.y1 - c.y0) * 2 / 5);
-  const idx = [];
-  for (let y = ym; y <= c.y1; y++) for (let x = c.x0, o = y * W; x <= c.x1; x++) if (lab[o + x] === c.id) idx.push(o + x);
-  if (idx.length < 40) return null;
-  const step = Math.max(1, Math.floor(idx.length / 1500));
-  const P = [];
-  for (let j = 0; j < idx.length; j += step) P.push(idx[j]);
-  const N = P.length;
+  let m = 0;
+  for (let y = ym; y <= c.y1; y++) for (let x = c.x0, o = y * W; x <= c.x1; x++) if (lab[o + x] === c.id) idx[m++] = o + x;
+  if (m < 40) return null;
+  const step = Math.max(1, Math.floor(m / 1500));
+  const N = Math.ceil(m / step);
   let lo, hi;
   if (pred != null) { const r = Math.max(6, Math.round(6 * dtf)); lo = Math.round(pred) - r; hi = Math.round(pred) + r; }
-  else { const r = Math.min(120, Math.round(70 * dtf)); lo = -r; hi = r; }
-  const C = new Map();
+  else { const r = Math.min(120, Math.round(70 * dtf * PW / 480)); lo = -r; hi = r; }
+  const C = new Float64Array(hi - lo + 1).fill(NaN);
   let best = Infinity, bs = 0;
   for (let s = lo; s <= hi; s++) {
     let sum = 0, cnt = 0;
-    for (let j = 0; j < N; j++) {
-      const i = P[j], x = i % W - s;
+    for (let j = 0; j < m; j += step) {
+      const i = idx[j], x = i % W - s;
       if (x < 0 || x >= W) continue;
       const e = Math.abs(cur[i] - prev[i - s]);
       sum += e < 40 ? e : 40; cnt++;
     }
     if (cnt < 0.7 * N) continue;
-    const v = sum / cnt; C.set(s, v);
+    const v = sum / cnt; C[s - lo] = v;
     if (v < best) { best = v; bs = s; }
   }
   if (!Number.isFinite(best)) return null;
-  const cm = C.get(bs - 1), cp = C.get(bs + 1);
-  if (cm == null || cp == null) return bs;
+  const cm = bs - 1 >= lo ? C[bs - 1 - lo] : NaN, cp = bs + 1 <= hi ? C[bs + 1 - lo] : NaN;
+  if (Number.isNaN(cm) || Number.isNaN(cp)) return bs;
   const dd = cm - 2 * best + cp;
   return bs + (dd > 1e-6 ? 0.5 * (cm - cp) / dd : 0);
 }
@@ -730,13 +752,16 @@ function updateTracks(dets, t) {
     usedT.add(ti); used.add(di);
     const tr = S.tracks[ti], d = dets[di];
     tr.pts.push({ t, X: d.X, Y: d.Y });
+    if (tr.pts.length > 400) tr.pts.splice(0, tr.pts.length - 400);
     if (dtFrame > 0 && dtFrame < 0.25 && d.mpp) {
       const dtf = dtFrame * 30;
-      const sp = corrShift(d.c, tr.pxs != null ? tr.pxs * dtFrame : null, dtf);
+      let sp = corrShift(d.c, tr.pxs != null ? tr.pxs * dtFrame : null, dtf);
+      if (sp != null) sp -= S.resX - S.prevResX;            // descuenta lo que se movió la cámara entre cuadros
       if (sp != null) {
         tr.pxs = sp / dtFrame;
         tr.vi.push(sp * d.mpp / dtFrame * 3.6);           // km/h con signo: + hacia la derecha de la imagen
         tr.wm.push(d.mpp * PW);
+        if (tr.vi.length > 400) { tr.vi.splice(0, tr.vi.length - 400); tr.wm.splice(0, tr.wm.length - 400); }
       }
     }
     const recent = tr.pts.slice(-6);
@@ -748,12 +773,17 @@ function updateTracks(dets, t) {
   }
   dets.forEach((d, di) => {
     if (used.has(di)) return;
-    const tr = { id: S.nextId++, pts: [{ t, X: d.X, Y: d.Y }], vx: 0, vy: 0, vi: [], wm: [], pxs: null };
+    const tr = { id: S.nextId++, first: { t, X: d.X, Y: d.Y }, pts: [{ t, X: d.X, Y: d.Y }], vx: 0, vy: 0, vi: [], wm: [], pxs: null };
     S.tracks.push(tr); d.track = tr;
   });
   const alive = [];
   for (const tr of S.tracks) {
-    if (t - tr.pts[tr.pts.length - 1].t > 0.5) finishTrack(tr); else alive.push(tr);
+    if (t - tr.pts[tr.pts.length - 1].t > 0.5) { finishTrack(tr); continue; }
+    // Objetos quietos (fantasmas, vehículos detenidos) o pistas eternas: se descartan para que no
+    // acumulen memoria ni absorban a los vehículos que pasan cerca
+    if (t - tr.first.t > 15) continue;
+    if (tr.vi.length >= 20 && Math.abs(median(tr.vi.slice(-20))) < 3) continue;
+    alive.push(tr);
   }
   S.tracks = alive;
 }
@@ -762,7 +792,7 @@ function finishTrack(tr) {
   if (tr.vi.length < 5) return;
   const vi = tr.vi, med = median(vi), mad = median(vi.map((x) => Math.abs(x - med))) * 1.4826;
   const v = Math.abs(med), q = 1 - Math.min(1, mad / Math.max(v, 1e-6));
-  const first = tr.pts[0], last = tr.pts[tr.pts.length - 1], dur = last.t - first.t;
+  const first = tr.first, last = tr.pts[tr.pts.length - 1], dur = last.t - first.t;
   const span = Math.hypot(last.X - first.X, last.Y - first.Y);
   const minTravel = num('minTravel') > 0 ? num('minTravel') : 4;
   if (span < minTravel) return;
@@ -793,14 +823,28 @@ function finishTrack(tr) {
 // ================= Bucle de cámara =================
 function onFrame(now, meta) {
   if (!S.running) return;
+  if (meta && Number.isFinite(meta.presentedFrames)) {
+    if (meta.presentedFrames === S.lastPF) { schedule(); return; }   // mismo cuadro: no aporta
+    S.lastPF = meta.presentedFrames;
+  }
   // Video grabado: tiempo propio del video. Cámara: hora de captura del fotograma.
   const t = S.fileMode ? (meta && Number.isFinite(meta.mediaTime) ? meta.mediaTime : video.currentTime)
     : ((meta && (meta.captureTime || meta.expectedDisplayTime)) || now) / 1000;
-  processFrame(t);
-  S.frames++;
+  const p0 = performance.now();
+  const done = processFrame(t);
+  const ms = performance.now() - p0;
+  if (done) {
+    S.frames++;
+    S.ema = S.ema ? S.ema * 0.95 + ms * 0.05 : ms;
+    S.levelFrames++;
+    // Si el celular tarda más de 45 ms por cuadro (menos de ~20 cuadros/s), se analiza con menos resolución
+    if ($('res').value === 'auto' && S.levelFrames > 60 && S.ema > 45 && PW > LEVELS[LEVELS.length - 1]) {
+      setLevel(LEVELS[LEVELS.indexOf(PW) + 1], 'El celular iba lento: se bajó la resolución de análisis. Aprendiendo el fondo otra vez.');
+    }
+  }
   if (now - S.fpsT0 > 1000) {
     const mv = Math.hypot(S.offX, S.offY) * 100;
-    $('fpsLbl').textContent = `${nf(S.frames * 1000 / (now - S.fpsT0), 0)} fps · cámara corrida ${nf(mv, 1)} %`;
+    $('fpsLbl').textContent = `${nf(S.frames * 1000 / (now - S.fpsT0), 0)} cuadros/s · ${nf(S.ema, 0)} ms · ${PW} px · cámara corrida ${nf(mv, 1)} %`;
     S.frames = 0; S.fpsT0 = now;
   }
   schedule();
@@ -811,23 +855,38 @@ function schedule() {
   else requestAnimationFrame((n) => onFrame(n, null));
 }
 function processFrame(t) {
-  if (video.readyState < 2) return;
-  if (video.videoWidth !== S.srcW || video.videoHeight !== S.srcH) { setSourceSize(); return; }
-  stabUpdate();
-  const kk = PW / SW, sx = S.stab.dx * kk, sy = S.stab.dy * kk;
-  S.offX = sx / PW; S.offY = sy / S.PH;
-  pctx.clearRect(0, 0, PW, S.PH);
-  pctx.drawImage(video, -sx, -sy, PW, S.PH);
+  if (video.readyState < 2) return false;
+  if (video.videoWidth !== S.srcW || video.videoHeight !== S.srcH) { setSourceSize(); return false; }
+  const W = PW, H = S.PH, sx = S.offX * W, sy = S.offY * H;
+  pctx.filter = GPU_BLUR ? 'blur(1px)' : 'none';
+  pctx.clearRect(0, 0, W, H);
+  pctx.drawImage(video, -sx, -sy, W, H);
   const mg = 4;
-  S.valid = { x0: Math.ceil(Math.max(0, -sx)) + mg, x1: Math.floor(Math.min(PW, PW - sx)) - 1 - mg,
-              y0: Math.ceil(Math.max(0, -sy)) + mg, y1: Math.floor(Math.min(S.PH, S.PH - sy)) - 1 - mg };
-  const img = pctx.getImageData(0, 0, PW, S.PH), raw = img.data;
+  S.valid = { x0: Math.ceil(Math.max(0, -sx)) + mg, x1: Math.floor(Math.min(W, W - sx)) - 1 - mg,
+              y0: Math.ceil(Math.max(0, -sy)) + mg, y1: Math.floor(Math.min(H, H - sy)) - 1 - mg };
+  const raw = pctx.getImageData(0, 0, W, H).data;
+  if (GPU_BLUR) { const b = S.bl; for (let i = 0, p = 0; i < b.length; i += 3, p += 4) { b[i] = raw[p]; b[i + 1] = raw[p + 1]; b[i + 2] = raw[p + 2]; } }
+  else blur3(raw);
+  // Cuadro idéntico al anterior (el celular entregó el mismo): se ignora, si no daría velocidad cero
   [S.gray, S.prevGray] = [S.prevGray, S.gray];
-  for (let i = 0, p = 0; i < S.gray.length; i++, p += 4) S.gray[i] = raw[p] * 0.3 + raw[p + 1] * 0.59 + raw[p + 2] * 0.11;
-  segment(raw);
+  const g = S.gray, b = S.bl;
+  let same = true;
+  for (let i = 0, q = 0; i < g.length; i++, q += 3) {
+    g[i] = b[q] * 0.3 + b[q + 1] * 0.59 + b[q + 2] * 0.11;
+    if (same && g[i] !== S.prevGray[i]) same = false;
+  }
+  if (same && S.prevT > 0) { [S.gray, S.prevGray] = [S.prevGray, S.gray]; return false; }
+  const [rx, ry] = stabResidual();
+  S.prevResX = S.resX; S.resX = rx;
+  S.offX += rx / W; S.offY += ry / H;            // corrección para el cuadro siguiente
+  if (Math.max(Math.abs(S.offX), Math.abs(S.offY)) > 0.15 && performance.now() - S.lastWarn > 4000) {
+    S.lastWarn = performance.now();
+    setStatus('La cámara se movió demasiado. Fíjala, pulsa «Detener» e «Iniciar cámara», y revisa la calibración.');
+  }
+  segment();
   S.dets = [];
   if (!CAL.error && S.warm >= 15) {
-    const k = S.srcW / PW;
+    const k = S.srcW / W;
     for (const c of components()) {
       const det = { c, partial: c.partial };
       if (!c.partial) {
@@ -838,8 +897,8 @@ function processFrame(t) {
             det.X = w[0]; det.Y = w[1];
             // metros por píxel horizontal en el punto de contacto con la calzada
             const um = (c.l[0] + c.r[0]) / 2 * k, vm = (c.l[1] + c.r[1]) / 2 * k;
-            const a = CAL.toWorld(um, vm), b = CAL.toWorld(um + k, vm);
-            if (a && b) det.mpp = Math.hypot(b[0] - a[0], b[1] - a[1]);
+            const a = CAL.toWorld(um, vm), bb = CAL.toWorld(um + k, vm);
+            if (a && bb) det.mpp = Math.hypot(bb[0] - a[0], bb[1] - a[1]);
           }
         }
       }
@@ -849,6 +908,7 @@ function processFrame(t) {
   }
   S.prevT = t;
   drawOverlay();
+  return true;
 }
 
 async function start() {
@@ -873,7 +933,7 @@ async function start() {
   $('placeholder').hidden = true;
   $('stopBtn').disabled = false; $('bgBtn').disabled = false;
   S.wallOffset = Date.now() - performance.now();
-  S.running = true; S.fpsT0 = performance.now(); S.frames = 0; S.prevT = 0;
+  S.running = true; S.fpsT0 = performance.now(); S.frames = 0; S.prevT = 0; S.lastPF = -1;
   requestWake();
   setStatus('Aprendiendo el fondo. Luego empieza a medir.');
   schedule();
@@ -899,7 +959,9 @@ function setSourceSize() {
   S.srcW = video.videoWidth || S.srcW; S.srcH = video.videoHeight || S.srcH;
   stage.style.aspectRatio = `${S.srcW} / ${S.srcH}`;
   stage.style.setProperty('--ar', String(S.srcW / S.srcH));
-  allocate(); rebuildCal(); resizeOverlay();
+  const pick = $('res').value;
+  PW = pick === 'auto' ? LEVELS[0] : Number(pick);
+  resetStab(); allocate(); rebuildCal(); resizeOverlay();
 }
 async function requestWake() {
   try { if ('wakeLock' in navigator) S.wakeLock = await navigator.wakeLock.request('screen'); } catch (e) { /* no disponible */ }
@@ -926,7 +988,7 @@ $('fileIn').addEventListener('change', async () => {
   const dur = Number.isFinite(video.duration) ? video.duration : 0;
   S.wallOffset = (file.lastModified || Date.now()) - dur * 1000;   // inicio aproximado de la grabación
   S.logStart = S.log.length;
-  S.running = true; S.fpsT0 = performance.now(); S.frames = 0; S.prevT = 0;
+  S.running = true; S.fpsT0 = performance.now(); S.frames = 0; S.prevT = 0; S.lastPF = -1;
   setStatus(`Analizando ${file.name}. Aprendiendo el fondo...`);
   schedule();
   video.play().catch(() => setStatus('El navegador no dejó reproducir el video.'));
@@ -942,35 +1004,97 @@ video.addEventListener('ended', () => {
 });
 $('stopBtn').addEventListener('click', stop);
 $('bgBtn').addEventListener('click', () => { S.warm = 0; S.tracks = []; S.prevT = 0; setStatus('Reaprendiendo el fondo.'); });
+$('res').addEventListener('change', () => {
+  if (!S.running) return;
+  const v = $('res').value;
+  setLevel(v === 'auto' ? LEVELS[0] : Number(v), 'Resolución de análisis cambiada. Aprendiendo el fondo otra vez.');
+});
 
 // ================= Dibujo =================
-function label(txt, x, y, color = '#fff', align = 'left') {
-  octx.save();
-  octx.font = '600 12px "IBM Plex Sans", system-ui, sans-serif';
-  octx.textAlign = align; octx.textBaseline = 'middle';
-  octx.lineWidth = 3; octx.strokeStyle = 'rgba(0,0,0,0.75)'; octx.strokeText(txt, x, y);
-  octx.fillStyle = color; octx.fillText(txt, x, y);
-  octx.restore();
+function label(txt, x, y, color = '#fff', align = 'left', cx = octx) {
+  cx.save();
+  cx.font = '600 12px "IBM Plex Sans", system-ui, sans-serif';
+  cx.textAlign = align; cx.textBaseline = 'middle';
+  cx.lineWidth = 3; cx.strokeStyle = 'rgba(0,0,0,0.75)'; cx.strokeText(txt, x, y);
+  cx.fillStyle = color; cx.fillText(txt, x, y);
+  cx.restore();
 }
-function worldLine(pts, k, W, H) {
-  octx.beginPath(); let pen = false;
+function worldLine(pts, k, W, H, cx = octx) {
+  cx.beginPath(); let pen = false;
   for (const [X, Y] of pts) {
     const p = CAL.toImage(X, Y);
     if (!p) { pen = false; continue; }
     const x = p[0] * k, y = p[1] * k;
     if (x < -W || x > 2 * W || y < -H || y > 2 * H) { pen = false; continue; }
-    pen ? octx.lineTo(x, y) : octx.moveTo(x, y); pen = true;
+    pen ? cx.lineTo(x, y) : cx.moveTo(x, y); pen = true;
   }
-  octx.stroke();
+  cx.stroke();
 }
 const sample = (a, b, m = 50) => Array.from({ length: m + 1 }, (_, i) => a + (b - a) * i / m);
+// Lo que está en coordenadas de la imagen de referencia y no cambia cuadro a cuadro se dibuja una vez
+function drawStatic(cx, W, H) {
+  const k = W / S.srcW;
+  if (!CAL.error) {
+    const z = CAL.zone;
+    if ($('showGrid').checked) {
+      cx.save(); cx.strokeStyle = '#fff'; cx.lineWidth = 1;
+      const gx0 = Math.max(z.x0, -30), gx1 = Math.min(z.x1, 30);
+      for (let X = Math.ceil(gx0); X <= gx1; X++) { cx.globalAlpha = X % 5 === 0 ? 0.45 : 0.16; worldLine(sample(z.y0, z.y1).map((Y) => [X, Y]), k, W, H, cx); }
+      for (let Y = Math.ceil(z.y0); Y <= z.y1; Y++) { cx.globalAlpha = Y % 5 === 0 ? 0.45 : 0.16; worldLine(sample(gx0, gx1).map((X) => [X, Y]), k, W, H, cx); }
+      cx.restore();
+      if (CAL.kind === 'geo') {
+        const p1 = CAL.toImage(-1e4, 1e5), p2 = CAL.toImage(1e4, 1e5);
+        if (p1 && p2 && Math.abs(p2[0] - p1[0]) > 1e-6) {
+          const m = (p2[1] - p1[1]) / (p2[0] - p1[0]), yAt = (x) => p1[1] * k + m * (x - p1[0] * k);
+          cx.save(); cx.strokeStyle = '#fde047'; cx.lineWidth = 1.5; cx.setLineDash([8, 6]);
+          cx.beginPath(); cx.moveTo(-W, yAt(-W)); cx.lineTo(2 * W, yAt(2 * W)); cx.stroke(); cx.restore();
+          const ly = yAt(8) - 9; label('Horizonte calculado', 8, ly < 10 ? yAt(8) + 11 : ly, '#fde047', 'left', cx);
+        }
+      }
+    }
+    cx.save(); cx.strokeStyle = '#38bdf8'; cx.lineWidth = 2; cx.setLineDash([6, 4]);
+    const x0 = Math.max(z.x0, -40), x1 = Math.min(z.x1, 40);
+    worldLine(sample(x0, x1, 80).map((X) => [X, z.y0]), k, W, H, cx);
+    worldLine(sample(x0, x1, 80).map((X) => [X, z.y1]), k, W, H, cx);
+    cx.restore();
+  }
+  if (S.calMode === 'ref' && S.refPts.length) {
+    const P = S.refPts.map((p) => [p.x * W, p.y * H]);
+    cx.save(); cx.strokeStyle = '#f59e0b'; cx.lineWidth = 2;
+    cx.beginPath(); P.forEach((p, i) => i ? cx.lineTo(p[0], p[1]) : cx.moveTo(p[0], p[1]));
+    if (P.length === 4) cx.closePath();
+    cx.stroke(); cx.restore();
+    P.forEach((p, i) => {
+      cx.beginPath(); cx.arc(p[0], p[1], 10, 0, 2 * Math.PI); cx.fillStyle = '#f59e0b'; cx.fill();
+      cx.fillStyle = '#111'; cx.font = '700 12px system-ui'; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+      cx.fillText(String(i + 1), p[0], p[1] + 0.5);
+    });
+  }
+  if (S.checkPts.length) {
+    const P = S.checkPts.map((p) => [p.x * W, p.y * H]);
+    cx.save(); cx.strokeStyle = '#e879f9'; cx.fillStyle = '#e879f9'; cx.lineWidth = 2;
+    if (P.length === 2) { cx.beginPath(); cx.moveTo(P[0][0], P[0][1]); cx.lineTo(P[1][0], P[1][1]); cx.stroke(); }
+    for (const q of P) { cx.beginPath(); cx.arc(q[0], q[1], 6, 0, 2 * Math.PI); cx.fill(); }
+    cx.restore();
+    const d = checkDist();
+    if (P.length === 2 && Number.isFinite(d)) label(`${nf(d, 2)} m`, (P[0][0] + P[1][0]) / 2, (P[0][1] + P[1][1]) / 2 - 12, '#e879f9', 'center', cx);
+  }
+}
 function drawOverlay() {
   const W = ov.clientWidth, H = ov.clientHeight;
   if (!W || !H) return;
+  const dpr = window.devicePixelRatio || 1;
+  const key = [S.calVer, W, H, dpr, S.calMode, $('showGrid').checked, JSON.stringify(S.refPts), JSON.stringify(S.checkPts)].join('|');
+  if (key !== S.staticKey) {
+    S.staticKey = key;
+    stc.width = Math.round(W * dpr); stc.height = Math.round(H * dpr);
+    sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    sctx.clearRect(0, 0, W, H);
+    drawStatic(sctx, W, H);
+  }
   octx.clearRect(0, 0, W, H);
   octx.save();
   octx.translate(S.offX * W, S.offY * H);   // de la imagen de referencia a la imagen que se ve ahora
-  const k = W / S.srcW;
 
   if (S.running && $('showMask').checked && S.fg) {
     const m = S.maskImg.data;
@@ -978,54 +1102,7 @@ function drawOverlay() {
     pctx.putImageData(S.maskImg, 0, 0);
     octx.drawImage(proc, 0, 0, W, H);
   }
-
-  if (!CAL.error) {
-    const z = CAL.zone;
-    if ($('showGrid').checked) {
-      octx.save(); octx.strokeStyle = '#fff'; octx.lineWidth = 1;
-      const gx0 = Math.max(z.x0, -30), gx1 = Math.min(z.x1, 30);
-      for (let X = Math.ceil(gx0); X <= gx1; X++) { octx.globalAlpha = X % 5 === 0 ? 0.45 : 0.16; worldLine(sample(z.y0, z.y1).map((Y) => [X, Y]), k, W, H); }
-      for (let Y = Math.ceil(z.y0); Y <= z.y1; Y++) { octx.globalAlpha = Y % 5 === 0 ? 0.45 : 0.16; worldLine(sample(gx0, gx1).map((X) => [X, Y]), k, W, H); }
-      octx.restore();
-      if (CAL.kind === 'geo') {
-        const p1 = CAL.toImage(-1e4, 1e5), p2 = CAL.toImage(1e4, 1e5);
-        if (p1 && p2 && Math.abs(p2[0] - p1[0]) > 1e-6) {
-          const m = (p2[1] - p1[1]) / (p2[0] - p1[0]), yAt = (x) => p1[1] * k + m * (x - p1[0] * k);
-          octx.save(); octx.strokeStyle = '#fde047'; octx.lineWidth = 1.5; octx.setLineDash([8, 6]);
-          octx.beginPath(); octx.moveTo(0, yAt(0)); octx.lineTo(W, yAt(W)); octx.stroke(); octx.restore();
-          const ly = yAt(8) - 9; label('Horizonte calculado', 8, ly < 10 ? yAt(8) + 11 : ly, '#fde047');
-        }
-      }
-    }
-    octx.save(); octx.strokeStyle = '#38bdf8'; octx.lineWidth = 2; octx.setLineDash([6, 4]);
-    const x0 = Math.max(z.x0, -40), x1 = Math.min(z.x1, 40);
-    worldLine(sample(x0, x1, 80).map((X) => [X, z.y0]), k, W, H);
-    worldLine(sample(x0, x1, 80).map((X) => [X, z.y1]), k, W, H);
-    octx.restore();
-  }
-
-  if (S.calMode === 'ref' && S.refPts.length) {
-    const P = S.refPts.map((p) => [p.x * W, p.y * H]);
-    octx.save(); octx.strokeStyle = '#f59e0b'; octx.lineWidth = 2;
-    octx.beginPath(); P.forEach((p, i) => i ? octx.lineTo(p[0], p[1]) : octx.moveTo(p[0], p[1]));
-    if (P.length === 4) octx.closePath();
-    octx.stroke(); octx.restore();
-    P.forEach((p, i) => {
-      octx.beginPath(); octx.arc(p[0], p[1], 10, 0, 2 * Math.PI); octx.fillStyle = '#f59e0b'; octx.fill();
-      octx.fillStyle = '#111'; octx.font = '700 12px system-ui'; octx.textAlign = 'center'; octx.textBaseline = 'middle';
-      octx.fillText(String(i + 1), p[0], p[1] + 0.5);
-    });
-  }
-
-  if (S.checkPts.length) {
-    const P = S.checkPts.map((p) => [p.x * W, p.y * H]);
-    octx.save(); octx.strokeStyle = '#e879f9'; octx.fillStyle = '#e879f9'; octx.lineWidth = 2;
-    if (P.length === 2) { octx.beginPath(); octx.moveTo(P[0][0], P[0][1]); octx.lineTo(P[1][0], P[1][1]); octx.stroke(); }
-    for (const q of P) { octx.beginPath(); octx.arc(q[0], q[1], 6, 0, 2 * Math.PI); octx.fill(); }
-    octx.restore();
-    const d = checkDist();
-    if (P.length === 2 && Number.isFinite(d)) label(`${nf(d, 2)} m`, (P[0][0] + P[1][0]) / 2, (P[0][1] + P[1][1]) / 2 - 12, '#e879f9', 'center');
-  }
+  octx.drawImage(stc, 0, 0, W, H);
 
   const kp = W / PW;
   for (const d of S.dets) {
@@ -1039,7 +1116,7 @@ function drawOverlay() {
       const tr = d.track;
       if (tr) {
         let txt = `#${tr.id}`;
-        if (tr.vi.length >= 5) txt += ` · ${nf(Math.abs(median(tr.vi)), 0)} km/h`;
+        if (tr.vi.length >= 5) txt += ` · ${nf(Math.abs(median(tr.vi.slice(-30))), 0)} km/h`;
         label(txt, c.x0 * kp, Math.max(10, c.y0 * kp - 9), '#22c55e');
       }
     }
@@ -1221,7 +1298,7 @@ $('clearLog').addEventListener('click', () => {
 });
 
 // ================= Ajustes =================
-const SETTING_IDS = ['gH', 'gTilt', 'gRoll', 'gFocalMode', 'gFov', 'gF35', 'gCrop', 'gNear', 'gFar', 'rA', 'rB', 'rExt', 'thr', 'minArea', 'minTravel', 'vMin', 'vMax', 'limit'];
+const SETTING_IDS = ['res', 'gH', 'gTilt', 'gRoll', 'gFocalMode', 'gFov', 'gF35', 'gCrop', 'gNear', 'gFar', 'rA', 'rB', 'rExt', 'thr', 'minArea', 'minTravel', 'vMin', 'vMax', 'limit'];
 const CHECK_IDS = ['showGrid', 'shadows', 'showMask'];
 function saveSettings() {
   const o = { calMode: S.calMode, refPts: S.refPts };
