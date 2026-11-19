@@ -47,6 +47,10 @@ p { margin: 0; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
 .between { justify-content: space-between; align-items: center; }
 .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+label.btn { display: inline-flex; align-items: center; font-size: 14px; color: var(--ink); padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); cursor: pointer; }
+label.btn:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.fs label.btn { padding: 6px 10px; font-size: 13px; flex: 0 0 auto; }
 button { font: inherit; font-size: 14px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); cursor: pointer; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 button[aria-pressed="true"] { background: var(--soft); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
@@ -155,6 +159,7 @@ details ul, details ol { margin: 10px 0 0; padding-left: 20px; color: var(--mute
         <button class="primary" id="startBtn">Iniciar cámara</button>
         <button id="stopBtn" disabled>Detener</button>
         <button id="bgBtn" disabled>Reaprender fondo</button>
+        <label class="btn" for="fileIn">Analizar un video<input type="file" id="fileIn" accept="video/*" class="sr-only"></label>
         <button id="fsBtn">Pantalla completa</button>
         <button id="panelBtn" aria-pressed="false">Ocultar ajustes</button>
       </div>
@@ -270,7 +275,7 @@ details ul, details ol { margin: 10px 0 0; padding-left: 20px; color: var(--mute
     </div>
     <div class="tablewrap">
       <table>
-        <thead><tr><th class="l">Fecha</th><th class="l">Hora</th><th>km/h</th><th class="l">Sentido</th><th>Muestras</th><th>Recorrido (m)</th><th>R²</th></tr></thead>
+        <thead><tr><th class="l">Fecha</th><th class="l">Hora</th><th>km/h</th><th class="l">Sentido</th><th>Muestras</th><th>Recorrido (m)</th><th>Consistencia</th></tr></thead>
         <tbody id="logBody"></tbody>
       </table>
     </div>
@@ -282,9 +287,10 @@ details ul, details ol { margin: 10px 0 0; padding-left: 20px; color: var(--mute
     <summary>Cómo montar la medición</summary>
     <ol>
       <li>Abre esta página desde una dirección https. Los navegadores solo dan acceso a la cámara en conexiones seguras.</li>
-      <li>Fija el celular en horizontal, en un trípode, mirando perpendicular a la vía. Más altura reduce las oclusiones entre vehículos.</li>
+      <li>Fija el celular en horizontal, en un trípode, mirando perpendicular a la vía. Más altura reduce las oclusiones entre vehículos. Si lo sostienes en la mano, la página corrige movimientos pequeños usando el andén como referencia; el indicador «cámara corrida» muestra cuánto se ha movido.</li>
       <li>Calibra. La referencia en el suelo medida con cinta suele ser más exacta que la geometría. Con geometría, la línea de horizonte dibujada debe pasar por donde la vía se pierde a lo lejos.</li>
       <li>Espera unos segundos sin vehículos para que la página aprenda el fondo. Si cambia la luz, pulsa «Reaprender fondo».</li>
+      <li>Con «Analizar un video» se procesa un video grabado con el mismo celular. La hora de cada registro se calcula con la fecha del archivo, que en la mayoría de celulares es el final de la grabación; revísala.</li>
       <li>La página mantiene la pantalla encendida mientras mide, si el navegador lo permite.</li>
     </ol>
     <ul>
@@ -307,6 +313,9 @@ const STORE_SET = 'velocimetro.ajustes.v1', STORE_LOG = 'velocimetro.registro.v1
 const PW = 480;                         // ancho de procesamiento
 const proc = document.createElement('canvas');
 const pctx = proc.getContext('2d', { willReadFrequently: true });
+const SW = 240;                         // ancho para medir el movimiento de la cámara
+const scv = document.createElement('canvas');
+const sctx = scv.getContext('2d', { willReadFrequently: true });
 
 const S = {
   stream: null, running: false, srcW: 1280, srcH: 720, PH: 180,
@@ -314,6 +323,9 @@ const S = {
   bg: null, fg: null, tmp: null, lab: null, stack: null, warm: 0, fastLearn: 0, maskImg: null,
   tracks: [], nextId: 1, dets: [], log: [], wallOffset: 0,
   frames: 0, fpsT0: 0, wakeLock: null,
+  // Estabilización: desplazamiento de la imagen actual respecto a la de referencia
+  stab: { ref: null, SH: 135, dx: 0, dy: 0, M: 38, My: 22, y0: null, ax: true, ay: true }, offX: 0, offY: 0,
+  valid: null, bl: null, bl2: null, gray: null, prevGray: null, prevT: 0, lastWarn: 0, D: null,
 };
 
 const num = (id) => { const v = parseFloat(String($(id).value).replace(',', '.')); return Number.isFinite(v) ? v : NaN; };
@@ -360,6 +372,7 @@ function geoCal(tiltDeg) {
   const cal = makeGeoCal(h, tilt * RAD, roll * RAD, f, S.srcW / 2, S.srcH / 2);
   cal.zone = { x0: -60, x1: 60, y0: yN, y1: yF };
   cal.dirLabels = ['→', '←'];
+  cal.rightIsPlusX = true;
   return cal;
 }
 function solveLinear(A, b) {
@@ -411,8 +424,9 @@ function refCal() {
   if (!Hi) return { error: 'No se pudo calcular la calibración con esas esquinas.' };
   const cu = P.reduce((a, p) => a + p[0], 0) / 4, cv = P.reduce((a, p) => a + p[1], 0) / 4;
   const s0 = Math.sign(applyH(H, cu, cv)[2]), s1 = Math.sign(applyH(Hi, A / 2, B / 2)[2]);
+  const pa = applyH(Hi, 0, B / 2), pb = applyH(Hi, A, B / 2);
   return {
-    kind: 'ref', A, B,
+    kind: 'ref', A, B, rightIsPlusX: pb[0] / pb[2] > pa[0] / pa[2],
     zone: { x0: -ext, x1: A + ext, y0: -0.3, y1: B + 0.3 },
     dirLabels: ['1→2', '2→1'],
     toWorld(u, v) { const r = applyH(H, u, v); return r[2] * s0 > 0 ? [r[0], r[1]] : null; },
@@ -423,6 +437,7 @@ let CAL = { error: 'Sin calibrar.' };
 function rebuildCal() {
   CAL = S.calMode === 'geo' ? geoCal() : refCal();
   S.tracks = [];
+  S.stab.y0 = stabRowStart();
   $('calInfo').textContent = CAL.error || (S.calMode === 'geo'
     ? `Calibración lista. Focal ${nf(CAL.f, 0)} px.`
     : 'Calibración lista. La cuadrícula debe coincidir con las líneas de la vía.');
@@ -439,7 +454,95 @@ function allocate() {
   S.bg = new Float32Array(n * 3); S.fg = new Uint8Array(n); S.tmp = new Uint8Array(n);
   S.lab = new Int32Array(n); S.stack = new Int32Array(n);
   S.maskImg = new ImageData(PW, S.PH);
+  S.bl = new Float32Array(n * 3); S.bl2 = new Float32Array(n * 3);
+  S.gray = new Float32Array(n); S.prevGray = new Float32Array(n);
   S.warm = 0;
+  const st = S.stab;
+  st.SH = Math.max(2, Math.round(SW * S.srcH / S.srcW));
+  scv.width = SW; scv.height = st.SH;
+  st.ref = null; st.dx = 0; st.dy = 0; st.M = Math.round(SW * 0.16); st.My = Math.round(st.SH * 0.16);
+  S.D = new Float32Array(n);
+  S.offX = 0; S.offY = 0; S.valid = null;
+}
+
+// ================= Estabilización =================
+// El celular en la mano o un trípode que vibra mueven la imagen. Se mide el desplazamiento de cada
+// fotograma respecto al primero en la franja de suelo más cercana que la vía (andén), que no tiene tránsito,
+// y se corrige antes de detectar. Así la calibración sigue valiendo aunque la cámara se mueva un poco.
+function stabRowStart() {
+  if (CAL.error || !S.stab.SH) return null;
+  const z = CAL.zone, mx = (Math.max(z.x0, -20) + Math.min(z.x1, 20)) / 2;
+  let vmax = -1;
+  for (const Y of [z.y0, z.y1]) { const p = CAL.toImage(mx, Y); if (p && p[1] > vmax) vmax = p[1]; }
+  if (vmax < 0) return null;
+  return Math.round(vmax * S.stab.SH / S.srcH) + 2;   // se usa solo si deja al menos 15 % de la altura
+}
+function stabUpdate() {
+  const st = S.stab, SH = st.SH, M = st.M, My = st.My;
+  const y0 = st.y0 != null && SH - My - st.y0 >= 0.15 * SH ? st.y0 : My;
+  sctx.drawImage(video, 0, 0, SW, SH);
+  const d = sctx.getImageData(0, 0, SW, SH).data;
+  const g = new Float32Array(SW * SH);
+  for (let i = 0, p = 0; i < g.length; i++, p += 4) g[i] = d[p] * 0.3 + d[p + 1] * 0.59 + d[p + 2] * 0.11;
+  if (!st.ref) {
+    st.ref = g; st.dx = 0; st.dy = 0;
+    // Solo se corrige el eje en el que el suelo tiene textura (en un piso liso la medida sería ruido)
+    let gx = 0, gy = 0, n = 0;
+    for (let y = y0; y < SH - My - 1; y++) for (let x = M; x < SW - M - 1; x++) {
+      const i = y * SW + x; gx += Math.abs(g[i + 1] - g[i]); gy += Math.abs(g[i + SW] - g[i]); n++;
+    }
+    st.ax = n > 0 && gx / n >= 1.5; st.ay = n > 0 && gy / n >= 1.5;
+    return;
+  }
+  const ref = st.ref, C = new Map();
+  const cost = (ox, oy) => {
+    let sum = 0, n = 0;
+    for (let y = y0; y < SH - My; y += 2) {
+      const o = y * SW, o2 = (y + oy) * SW + ox;
+      for (let x = M; x < SW - M; x += 2) { const e = Math.abs(ref[o + x] - g[o2 + x]); sum += e < 25 ? e : 25; n++; }
+    }
+    return n ? sum / n : Infinity;
+  };
+  const cx = Math.round(st.dx), cy = Math.round(st.dy), lim = M - 2, limY = My - 2;
+  let best = Infinity, bx = cx, by = cy;
+  for (let oy = st.ay ? cy - 3 : 0; oy <= (st.ay ? cy + 3 : 0); oy++) {
+    for (let ox = st.ax ? cx - 3 : 0; ox <= (st.ax ? cx + 3 : 0); ox++) {
+      if (Math.abs(ox) > lim || Math.abs(oy) > limY) continue;
+      const c = cost(ox, oy); C.set(ox + ',' + oy, c);
+      if (c < best) { best = c; bx = ox; by = oy; }
+    }
+  }
+  const sub = (a, b, c) => { const dd = a - 2 * b + c; return dd > 1e-6 ? Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / dd)) : 0; };
+  const gc = (x, y) => C.get(x + ',' + y) ?? best;
+  st.dx = st.ax ? bx + sub(gc(bx - 1, by), best, gc(bx + 1, by)) : 0;
+  st.dy = st.ay ? by + sub(gc(bx, by - 1), best, gc(bx, by + 1)) : 0;
+  if ((Math.abs(st.dx) > lim - 2 || Math.abs(st.dy) > limY - 2) && performance.now() - S.lastWarn > 4000) {
+    S.lastWarn = performance.now();
+    setStatus('La cámara se movió demasiado. Fíjala, pulsa «Detener» e «Iniciar cámara», y revisa la calibración.');
+  }
+}
+// Gaussiano de radio 2 (σ≈1 px): reduce el parpadeo de texturas finas, como rejas, por movimientos menores de un píxel
+function blur3(d) {
+  const W = PW, H = S.PH, a = S.bl2, b = S.bl;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4, q = (y * W + x) * 3;
+      const xm2 = Math.max(0, x - 2) - x, xm1 = Math.max(0, x - 1) - x, xp1 = Math.min(W - 1, x + 1) - x, xp2 = Math.min(W - 1, x + 2) - x;
+      for (let c = 0; c < 3; c++) {
+        a[q + c] = (d[i + xm2 * 4 + c] + 4 * d[i + xm1 * 4 + c] + 6 * d[i + c] + 4 * d[i + xp1 * 4 + c] + d[i + xp2 * 4 + c]) / 16;
+      }
+    }
+  }
+  for (let y = 0; y < H; y++) {
+    const ym2 = Math.max(0, y - 2), ym1 = Math.max(0, y - 1), yp1 = Math.min(H - 1, y + 1), yp2 = Math.min(H - 1, y + 2);
+    for (let x = 0; x < W; x++) {
+      const q = (y * W + x) * 3;
+      for (let c = 0; c < 3; c++) {
+        b[q + c] = (a[(ym2 * W + x) * 3 + c] + 4 * a[(ym1 * W + x) * 3 + c] + 6 * a[q + c] + 4 * a[(yp1 * W + x) * 3 + c] + a[(yp2 * W + x) * 3 + c]) / 16;
+      }
+    }
+  }
+  return b;
 }
 function passH(src, dst, dil) {
   const W = PW, H = S.PH;
@@ -464,23 +567,28 @@ function passV(src, dst, dil) {
 const erode = (a) => { passH(a, S.tmp, false); passV(S.tmp, a, false); };
 const dilate = (a) => { passH(a, S.tmp, true); passV(S.tmp, a, true); };
 
-function segment(d) {
-  const n = PW * S.PH, bg = S.bg, fg = S.fg;
+function segment(raw) {
+  const n = PW * S.PH, bg = S.bg, fg = S.fg, d = blur3(raw), V = S.valid;
+  const inside = (i) => { const x = i % PW, y = (i / PW) | 0; return x >= V.x0 && x <= V.x1 && y >= V.y0 && y <= V.y1; };
   if (S.warm < 15) {
     // Primeros fotogramas: promedio rápido del fondo, sin detecciones
     const k = S.warm === 0 ? 1 : 0.3;
-    for (let i = 0, p = 0, q = 0; i < n; i++, p += 4, q += 3) {
-      bg[q] += (d[p] - bg[q]) * k; bg[q + 1] += (d[p + 1] - bg[q + 1]) * k; bg[q + 2] += (d[p + 2] - bg[q + 2]) * k;
+    for (let i = 0, q = 0; i < n; i++, q += 3) {
+      if (S.warm > 0 && !inside(i)) continue;
+      bg[q] += (d[q] - bg[q]) * k; bg[q + 1] += (d[q + 1] - bg[q + 1]) * k; bg[q + 2] += (d[q + 2] - bg[q + 2]) * k;
     }
     S.warm++;
     fg.fill(0);
     return 0;
   }
   const thr = (num('thr') > 0 ? num('thr') : 28) * 3, shadows = $('shadows').checked;
-  const kb = S.fastLearn > 0 ? 0.25 : 0.03, kf = S.fastLearn > 0 ? 0.25 : 0.002;
+  // Bajo un vehículo el fondo se actualiza despacio (kf), pero no tanto como para dejar fantasmas largos
+  const kb = S.fastLearn > 0 ? 0.25 : 0.03, kf = S.fastLearn > 0 ? 0.25 : 0.02;
   let count = 0;
-  for (let i = 0, p = 0, q = 0; i < n; i++, p += 4, q += 3) {
-    const r = d[p], g = d[p + 1], b = d[p + 2], br = bg[q], bgg = bg[q + 1], bb = bg[q + 2];
+  for (let i = 0, q = 0; i < n; i++, q += 3) {
+    if (!inside(i)) { fg[i] = 0; S.D[i] = 0; continue; }
+    const r = d[q], g = d[q + 1], b = d[q + 2], br = bg[q], bgg = bg[q + 1], bb = bg[q + 2];
+    S.D[i] = Math.abs(0.3 * (r - br) + 0.59 * (g - bgg) + 0.11 * (b - bb));
     let f = (Math.abs(r - br) + Math.abs(g - bgg) + Math.abs(b - bb)) > thr ? 1 : 0;
     if (f && shadows) {
       const I = r + g + b + 3, B = br + bgg + bb + 3, ratio = I / B;
@@ -533,9 +641,31 @@ function components() {
       }
     }
     // La limpieza morfológica borra unos píxeles del borde: un margen de 6 px evita usar vehículos cortados
-    out.push({ x0, x1, y0, y1, area, partial: x0 <= 6 || x1 >= W - 7 || y1 >= H - 4, l: [lx, ly + 1.5], r: [rx + 1, ry + 1.5] });  // +0,5 px: el borde real cae dentro de la primera fila de fondo
+    const V = S.valid;
+    const c = { id, x0, x1, y0, y1, area, partial: x0 <= V.x0 + 6 || x1 >= V.x1 - 6 || y1 >= V.y1 - 3, l: [lx, ly + 1.5], r: [rx + 1, ry + 1.5] };
+    const yr = refineContact(c);
+    if (yr != null) { c.l[1] = yr; c.r[1] = yr; }
+    out.push(c);  // +0,5 px: el borde real cae dentro de la primera fila de fondo
   }
   return out;
+}
+
+// El filtro de sombras confunde la parte baja de las llantas (gris oscuro sobre asfalto gris) con sombra,
+// y la mancha termina unos píxeles arriba del suelo; en el carril lejano 1 px puede ser 5 % de velocidad.
+// Se busca, de abajo hacia arriba, dónde la diferencia con el fondo cruza la mitad de su máximo,
+// en las columnas donde la mancha llega a su fila más baja (las llantas).
+function refineContact(c) {
+  const W = PW, H = S.PH, lab = S.lab, D = S.D;
+  const cols = [];
+  for (let x = c.x0; x <= c.x1; x++) if (lab[c.y1 * W + x] === c.id || (c.y1 > 0 && lab[(c.y1 - 1) * W + x] === c.id)) cols.push(x);
+  if (cols.length < 2) return null;
+  const ya = Math.max(0, c.y1 - 4), yb = Math.min(H - 1, c.y1 + 6), prof = [];
+  for (let y = ya; y <= yb; y++) { let s = 0; for (const x of cols) s += D[y * W + x]; prof.push(s / cols.length); }
+  const T = Math.max(10, 0.5 * Math.max(...prof));
+  for (let k = prof.length - 1; k > 0; k--) {
+    if (prof[k - 1] >= T && prof[k] < T) return ya + (k - 1) + 0.5 + (prof[k - 1] - T) / (prof[k - 1] - prof[k]);
+  }
+  return null;
 }
 
 function inZone(w) {
@@ -544,27 +674,45 @@ function inZone(w) {
 }
 
 // ================= Seguimiento y velocidad =================
-function fitSpeed(pts) {
-  const n = pts.length;
-  const mx = pts.reduce((a, p) => a + p.X, 0) / n, my = pts.reduce((a, p) => a + p.Y, 0) / n;
-  let sxx = 0, syy = 0, sxy = 0;
-  for (const p of pts) { const dx = p.X - mx, dy = p.Y - my; sxx += dx * dx; syy += dy * dy; sxy += dx * dy; }
-  const ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);
-  let ux = Math.cos(ang), uy = Math.sin(ang);
-  if (ux < 0) { ux = -ux; uy = -uy; }                 // eje orientado hacia +X de la vía
-  const s = pts.map((p) => (p.X - mx) * ux + (p.Y - my) * uy), t = pts.map((p) => p.t);
-  const tm = t.reduce((a, b) => a + b, 0) / n, sm = s.reduce((a, b) => a + b, 0) / n;
-  let stt = 0, sts = 0;
-  for (let i = 0; i < n; i++) { stt += (t[i] - tm) ** 2; sts += (t[i] - tm) * (s[i] - sm); }
-  if (!(stt > 0)) return null;
-  const slope = sts / stt;
-  let ssr = 0, sst = 0;
-  for (let i = 0; i < n; i++) { const r = s[i] - (sm + slope * (t[i] - tm)); ssr += r * r; sst += (s[i] - sm) ** 2; }
-  return { v: Math.abs(slope) * 3.6, dir: slope >= 0 ? 0 : 1, r2: sst > 0 ? 1 - ssr / sst : 0,
-           span: Math.max(...s) - Math.min(...s), dur: t[n - 1] - t[0], tMid: tm };
+// Desplazamiento horizontal (px de procesamiento) del vehículo entre el fotograma anterior y el actual.
+// Compara solo los píxeles del vehículo en la mitad inferior; no depende de cómo crece o se parte la mancha.
+function corrShift(c, pred, dtf) {
+  const W = PW, lab = S.lab, cur = S.gray, prev = S.prevGray;
+  const ym = c.y0 + Math.floor((c.y1 - c.y0) * 2 / 5);
+  const idx = [];
+  for (let y = ym; y <= c.y1; y++) for (let x = c.x0, o = y * W; x <= c.x1; x++) if (lab[o + x] === c.id) idx.push(o + x);
+  if (idx.length < 40) return null;
+  const step = Math.max(1, Math.floor(idx.length / 1500));
+  const P = [];
+  for (let j = 0; j < idx.length; j += step) P.push(idx[j]);
+  const N = P.length;
+  let lo, hi;
+  if (pred != null) { const r = Math.max(6, Math.round(6 * dtf)); lo = Math.round(pred) - r; hi = Math.round(pred) + r; }
+  else { const r = Math.min(120, Math.round(70 * dtf)); lo = -r; hi = r; }
+  const C = new Map();
+  let best = Infinity, bs = 0;
+  for (let s = lo; s <= hi; s++) {
+    let sum = 0, cnt = 0;
+    for (let j = 0; j < N; j++) {
+      const i = P[j], x = i % W - s;
+      if (x < 0 || x >= W) continue;
+      const e = Math.abs(cur[i] - prev[i - s]);
+      sum += e < 40 ? e : 40; cnt++;
+    }
+    if (cnt < 0.7 * N) continue;
+    const v = sum / cnt; C.set(s, v);
+    if (v < best) { best = v; bs = s; }
+  }
+  if (!Number.isFinite(best)) return null;
+  const cm = C.get(bs - 1), cp = C.get(bs + 1);
+  if (cm == null || cp == null) return bs;
+  const dd = cm - 2 * best + cp;
+  return bs + (dd > 1e-6 ? 0.5 * (cm - cp) / dd : 0);
 }
+function median(a) { const b = [...a].sort((x, y) => x - y), m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; }
 
 function updateTracks(dets, t) {
+  const dtFrame = S.prevT > 0 ? t - S.prevT : 0;
   const used = new Set(), pairs = [];
   S.tracks.forEach((tr, ti) => {
     const last = tr.pts[tr.pts.length - 1], dt = t - last.t;
@@ -582,6 +730,15 @@ function updateTracks(dets, t) {
     usedT.add(ti); used.add(di);
     const tr = S.tracks[ti], d = dets[di];
     tr.pts.push({ t, X: d.X, Y: d.Y });
+    if (dtFrame > 0 && dtFrame < 0.25 && d.mpp) {
+      const dtf = dtFrame * 30;
+      const sp = corrShift(d.c, tr.pxs != null ? tr.pxs * dtFrame : null, dtf);
+      if (sp != null) {
+        tr.pxs = sp / dtFrame;
+        tr.vi.push(sp * d.mpp / dtFrame * 3.6);           // km/h con signo: + hacia la derecha de la imagen
+        tr.wm.push(d.mpp * PW);
+      }
+    }
     const recent = tr.pts.slice(-6);
     if (recent.length >= 2) {
       const a = recent[0], b = recent[recent.length - 1], dtt = b.t - a.t;
@@ -591,7 +748,7 @@ function updateTracks(dets, t) {
   }
   dets.forEach((d, di) => {
     if (used.has(di)) return;
-    const tr = { id: S.nextId++, pts: [{ t, X: d.X, Y: d.Y }], vx: 0, vy: 0 };
+    const tr = { id: S.nextId++, pts: [{ t, X: d.X, Y: d.Y }], vx: 0, vy: 0, vi: [], wm: [], pxs: null };
     S.tracks.push(tr); d.track = tr;
   });
   const alive = [];
@@ -602,21 +759,29 @@ function updateTracks(dets, t) {
 }
 
 function finishTrack(tr) {
-  if (tr.pts.length < 6) return;
-  // Las primeras y últimas muestras suelen tener la silueta incompleta
-  const pts = tr.pts.length >= 12 ? tr.pts.slice(2, -2) : tr.pts;
-  const r = fitSpeed(pts);
-  if (!r) return;
+  if (tr.vi.length < 5) return;
+  const vi = tr.vi, med = median(vi), mad = median(vi.map((x) => Math.abs(x - med))) * 1.4826;
+  const v = Math.abs(med), q = 1 - Math.min(1, mad / Math.max(v, 1e-6));
+  const first = tr.pts[0], last = tr.pts[tr.pts.length - 1], dur = last.t - first.t;
+  const span = Math.hypot(last.X - first.X, last.Y - first.Y);
   const minTravel = num('minTravel') > 0 ? num('minTravel') : 4;
-  if (r.span < minTravel) return;
+  if (span < minTravel) return;
+  // Velocidades fotograma a fotograma dispersas o con tramos detenidos: la mancha mezcló vehículos o fondo
+  if (mad / Math.max(v, 1e-6) > 0.3 || vi.filter((x) => Math.abs(x) < 0.25 * v).length > 0.2 * vi.length) {
+    setStatus(`Lectura descartada por medición irregular (${nf(v, 0)} km/h).`); return;
+  }
+  // Una pista no puede durar mucho más que el tiempo que tarda el vehículo en cruzar la imagen
+  const wm = median(tr.wm);
+  if (v > 0 && dur > 1.3 * wm / (v / 3.6) + 0.3) { setStatus('Lectura descartada: la pista mezcló varios vehículos.'); return; }
   const vmin = num('vMin') || 0, vmax = num('vMax') || 1e9;
-  if (r.v < vmin || r.v > vmax) { setStatus(`Lectura descartada: ${nf(r.v, 0)} km/h fuera del rango.`); return; }
-  if (r.r2 < 0.9) { setStatus(`Lectura descartada por trayectoria irregular (R² ${nf(r.r2, 2)}).`); return; }
+  if (v < vmin || v > vmax) { setStatus(`Lectura descartada: ${nf(v, 0)} km/h fuera del rango.`); return; }
+  const dir = (med >= 0) === (CAL.rightIsPlusX !== false) ? 0 : 1;
+  const r = { v, dir, q, span, dur, tMid: (first.t + last.t) / 2 };
   const when = new Date(r.tMid * 1000 + S.wallOffset);
   const row = {
     fecha: `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())}`,
     hora: `${pad(when.getHours())}:${pad(when.getMinutes())}:${pad(when.getSeconds())}`,
-    v: r.v, dir: CAL.dirLabels[r.dir], n: tr.pts.length, span: r.span, dur: r.dur, r2: r.r2,
+    v: r.v, dir: CAL.dirLabels[r.dir], n: vi.length, span: r.span, dur: r.dur, q: r.q,
     metodo: S.calMode === 'geo' ? 'geometría' : 'referencia',
   };
   S.log.push(row);
@@ -628,10 +793,16 @@ function finishTrack(tr) {
 // ================= Bucle de cámara =================
 function onFrame(now, meta) {
   if (!S.running) return;
-  const tms = (meta && (meta.captureTime || meta.expectedDisplayTime)) || now;
-  processFrame(tms / 1000);
+  // Video grabado: tiempo propio del video. Cámara: hora de captura del fotograma.
+  const t = S.fileMode ? (meta && Number.isFinite(meta.mediaTime) ? meta.mediaTime : video.currentTime)
+    : ((meta && (meta.captureTime || meta.expectedDisplayTime)) || now) / 1000;
+  processFrame(t);
   S.frames++;
-  if (now - S.fpsT0 > 1000) { $('fpsLbl').textContent = `${nf(S.frames * 1000 / (now - S.fpsT0), 0)} fps procesados`; S.frames = 0; S.fpsT0 = now; }
+  if (now - S.fpsT0 > 1000) {
+    const mv = Math.hypot(S.offX, S.offY) * 100;
+    $('fpsLbl').textContent = `${nf(S.frames * 1000 / (now - S.fpsT0), 0)} fps · cámara corrida ${nf(mv, 1)} %`;
+    S.frames = 0; S.fpsT0 = now;
+  }
   schedule();
 }
 function schedule() {
@@ -642,9 +813,18 @@ function schedule() {
 function processFrame(t) {
   if (video.readyState < 2) return;
   if (video.videoWidth !== S.srcW || video.videoHeight !== S.srcH) { setSourceSize(); return; }
-  pctx.drawImage(video, 0, 0, PW, S.PH);
-  const img = pctx.getImageData(0, 0, PW, S.PH);
-  segment(img.data);
+  stabUpdate();
+  const kk = PW / SW, sx = S.stab.dx * kk, sy = S.stab.dy * kk;
+  S.offX = sx / PW; S.offY = sy / S.PH;
+  pctx.clearRect(0, 0, PW, S.PH);
+  pctx.drawImage(video, -sx, -sy, PW, S.PH);
+  const mg = 4;
+  S.valid = { x0: Math.ceil(Math.max(0, -sx)) + mg, x1: Math.floor(Math.min(PW, PW - sx)) - 1 - mg,
+              y0: Math.ceil(Math.max(0, -sy)) + mg, y1: Math.floor(Math.min(S.PH, S.PH - sy)) - 1 - mg };
+  const img = pctx.getImageData(0, 0, PW, S.PH), raw = img.data;
+  [S.gray, S.prevGray] = [S.prevGray, S.gray];
+  for (let i = 0, p = 0; i < S.gray.length; i++, p += 4) S.gray[i] = raw[p] * 0.3 + raw[p + 1] * 0.59 + raw[p + 2] * 0.11;
+  segment(raw);
   S.dets = [];
   if (!CAL.error && S.warm >= 15) {
     const k = S.srcW / PW;
@@ -654,17 +834,25 @@ function processFrame(t) {
         const wl = CAL.toWorld(c.l[0] * k, c.l[1] * k), wr = CAL.toWorld(c.r[0] * k, c.r[1] * k);
         if (wl && wr) {
           const w = [(wl[0] + wr[0]) / 2, (wl[1] + wr[1]) / 2];
-          if (inZone(w)) { det.X = w[0]; det.Y = w[1]; }
+          if (inZone(w)) {
+            det.X = w[0]; det.Y = w[1];
+            // metros por píxel horizontal en el punto de contacto con la calzada
+            const um = (c.l[0] + c.r[0]) / 2 * k, vm = (c.l[1] + c.r[1]) / 2 * k;
+            const a = CAL.toWorld(um, vm), b = CAL.toWorld(um + k, vm);
+            if (a && b) det.mpp = Math.hypot(b[0] - a[0], b[1] - a[1]);
+          }
         }
       }
       S.dets.push(det);
     }
     updateTracks(S.dets.filter((d) => Number.isFinite(d.X)), t);
   }
+  S.prevT = t;
   drawOverlay();
 }
 
 async function start() {
+  if (S.fileMode) stop();
   $('startBtn').disabled = true;
   if (!window.isSecureContext) setStatus('Aviso: esta página no está en https. El navegador puede negar la cámara.');
   else setStatus('Abriendo la cámara...');
@@ -685,7 +873,7 @@ async function start() {
   $('placeholder').hidden = true;
   $('stopBtn').disabled = false; $('bgBtn').disabled = false;
   S.wallOffset = Date.now() - performance.now();
-  S.running = true; S.fpsT0 = performance.now(); S.frames = 0;
+  S.running = true; S.fpsT0 = performance.now(); S.frames = 0; S.prevT = 0;
   requestWake();
   setStatus('Aprendiendo el fondo. Luego empieza a medir.');
   schedule();
@@ -694,6 +882,11 @@ function stop() {
   S.running = false;
   if (S.stream) S.stream.getTracks().forEach((t) => t.stop());
   S.stream = null; video.srcObject = null;
+  if (S.fileMode) {
+    video.pause(); video.removeAttribute('src'); video.load();
+    if (S.fileURL) { URL.revokeObjectURL(S.fileURL); S.fileURL = null; }
+    S.fileMode = false;
+  }
   S.tracks = []; S.dets = [];
   $('placeholder').hidden = false;
   $('startBtn').disabled = false; $('stopBtn').disabled = true; $('bgBtn').disabled = true;
@@ -713,8 +906,42 @@ async function requestWake() {
 }
 document.addEventListener('visibilitychange', () => { if (S.running && document.visibilityState === 'visible') requestWake(); });
 $('startBtn').addEventListener('click', start);
+
+// ================= Video grabado =================
+$('fileIn').addEventListener('change', async () => {
+  const file = $('fileIn').files[0];
+  $('fileIn').value = '';
+  if (!file) return;
+  if (S.running || S.fileMode) stop();
+  S.fileURL = URL.createObjectURL(file); S.fileMode = true;
+  video.srcObject = null; video.loop = false; video.muted = true; video.src = S.fileURL;
+  try {
+    await new Promise((ok, bad) => { video.addEventListener('loadedmetadata', ok, { once: true }); video.addEventListener('error', bad, { once: true }); });
+  } catch (e) {
+    S.fileMode = false; setStatus('El navegador no pudo abrir ese video. Prueba con un MP4 grabado por la cámara del celular.'); return;
+  }
+  setSourceSize();
+  $('placeholder').hidden = true;
+  $('stopBtn').disabled = false; $('bgBtn').disabled = false; $('startBtn').disabled = false;
+  const dur = Number.isFinite(video.duration) ? video.duration : 0;
+  S.wallOffset = (file.lastModified || Date.now()) - dur * 1000;   // inicio aproximado de la grabación
+  S.logStart = S.log.length;
+  S.running = true; S.fpsT0 = performance.now(); S.frames = 0; S.prevT = 0;
+  setStatus(`Analizando ${file.name}. Aprendiendo el fondo...`);
+  schedule();
+  video.play().catch(() => setStatus('El navegador no dejó reproducir el video.'));
+});
+video.addEventListener('ended', () => {
+  if (!S.fileMode) return;
+  S.running = false;
+  for (const tr of S.tracks) finishTrack(tr);
+  S.tracks = [];
+  const n = S.log.length - (S.logStart || 0);
+  setStatus(`Video analizado: ${n} vehículo${n === 1 ? '' : 's'} medido${n === 1 ? '' : 's'}.`);
+  $('bgBtn').disabled = true;
+});
 $('stopBtn').addEventListener('click', stop);
-$('bgBtn').addEventListener('click', () => { S.warm = 0; S.tracks = []; setStatus('Reaprendiendo el fondo.'); });
+$('bgBtn').addEventListener('click', () => { S.warm = 0; S.tracks = []; S.prevT = 0; setStatus('Reaprendiendo el fondo.'); });
 
 // ================= Dibujo =================
 function label(txt, x, y, color = '#fff', align = 'left') {
@@ -741,6 +968,8 @@ function drawOverlay() {
   const W = ov.clientWidth, H = ov.clientHeight;
   if (!W || !H) return;
   octx.clearRect(0, 0, W, H);
+  octx.save();
+  octx.translate(S.offX * W, S.offY * H);   // de la imagen de referencia a la imagen que se ve ahora
   const k = W / S.srcW;
 
   if (S.running && $('showMask').checked && S.fg) {
@@ -810,12 +1039,13 @@ function drawOverlay() {
       const tr = d.track;
       if (tr) {
         let txt = `#${tr.id}`;
-        if (tr.pts.length >= 5) { const r = fitSpeed(tr.pts); if (r) txt += ` · ${nf(r.v, 0)} km/h`; }
+        if (tr.vi.length >= 5) txt += ` · ${nf(Math.abs(median(tr.vi)), 0)} km/h`;
         label(txt, c.x0 * kp, Math.max(10, c.y0 * kp - 9), '#22c55e');
       }
     }
     octx.restore();
   }
+  octx.restore();
 }
 function resizeOverlay() {
   const r = stage.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
@@ -837,7 +1067,7 @@ $('refMode').addEventListener('click', () => setEdit('ref'));
 $('checkMode').addEventListener('click', () => setEdit('check'));
 $('refClear').addEventListener('click', () => { S.refPts = []; saveSettings(); rebuildCal(); });
 $('checkClear').addEventListener('click', () => { S.checkPts = []; $('fitMsg').textContent = ''; updateCheck(); drawOverlay(); });
-const ptrNorm = (e) => { const r = ov.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }; };
+const ptrNorm = (e) => { const r = ov.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width - S.offX, y: (e.clientY - r.top) / r.height - S.offY }; };
 ov.addEventListener('pointerdown', (e) => {
   if (!S.edit) return;
   e.preventDefault(); ov.setPointerCapture(e.pointerId);
@@ -956,7 +1186,7 @@ function renderLog(fresh) {
   const rows = L.slice(-300).reverse().map((r) => {
     const tr = document.createElement('tr');
     if (limit > 0 && r.v > limit) tr.className = 'over';
-    const cells = [[r.fecha, 'l'], [r.hora, 'l'], [nf(r.v, 1), 'v'], [r.dir, 'l'], [r.n, ''], [nf(r.span, 1), ''], [nf(r.r2, 3), '']];
+    const cells = [[r.fecha, 'l'], [r.hora, 'l'], [nf(r.v, 1), 'v'], [r.dir, 'l'], [r.n, ''], [nf(r.span, 1), ''], [nf(r.q ?? r.r2, 2), '']];
     for (const [v, cls] of cells) { const td = document.createElement('td'); td.textContent = v; if (cls) td.className = cls; tr.append(td); }
     return tr;
   });
@@ -966,8 +1196,8 @@ function saveLog() { try { localStorage.setItem(STORE_LOG, JSON.stringify(S.log.
 function csvText() {
   const limit = num('limit');
   const c = (x, d) => Number.isFinite(x) ? x.toFixed(d).replace('.', ',') : '';
-  const out = ['fecha;hora;velocidad_kmh;sentido;muestras;recorrido_m;duracion_s;r2;metodo;sobre_limite'];
-  for (const r of S.log) out.push([r.fecha, r.hora, c(r.v, 1), r.dir, r.n, c(r.span, 2), c(r.dur, 2), c(r.r2, 3), r.metodo, limit > 0 && r.v > limit ? 'sí' : 'no'].join(';'));
+  const out = ['fecha;hora;velocidad_kmh;sentido;muestras;recorrido_m;duracion_s;consistencia;metodo;sobre_limite'];
+  for (const r of S.log) out.push([r.fecha, r.hora, c(r.v, 1), r.dir, r.n, c(r.span, 2), c(r.dur, 2), c(r.q ?? r.r2, 3), r.metodo, limit > 0 && r.v > limit ? 'sí' : 'no'].join(';'));
   return out.join('\r\n');
 }
 $('csvBtn').addEventListener('click', () => {
