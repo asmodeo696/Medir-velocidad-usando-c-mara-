@@ -97,6 +97,10 @@ body.noscroll { overflow: hidden; }
 .fs #status { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .fs .side { position: static; max-height: none; height: 100%; overflow-y: auto; padding: 8px; border-left: 1px solid var(--line); }
 .fs .side .card { padding: 10px; gap: 10px; }
+/* En pantalla completa quedan los controles y los mensajes de estado; se ocultan las explicaciones */
+.fs .side .hint:not([id]), .fs .side .diagram { display: none; }
+.fs .side .hint:empty { display: none; }
+.fs .side label { font-size: 12px; }
 @media (orientation: portrait) {
   .workspace.fs { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1.3fr) minmax(0, 1fr); }
   .workspace.fs.nopanel { grid-template-rows: 100%; }
@@ -180,10 +184,9 @@ details ul, details ol { margin: 10px 0 0; padding-left: 20px; color: var(--mute
         <label>Inclinación hacia abajo (°)<input id="gTilt" type="number" step="any" value="5" inputmode="decimal"></label>
         <label>Giro lateral, roll (°)<input id="gRoll" type="number" step="any" value="0" inputmode="decimal"></label>
       </div>
-      <div class="row">
-        <button id="sensorBtn">Leer inclinación del celular</button>
-        <span class="hint" id="sensorMsg"></span>
-      </div>
+      <label class="check"><input type="checkbox" id="autoTilt"> Inclinación automática con el sensor del celular</label>
+      <p class="hint mono" id="sensorMsg"></p>
+      <p class="hint">Mientras preparas la toma, la inclinación sigue al sensor en tiempo real. Al pulsar «Iniciar cámara» o «Reaprender fondo» queda fija: desde ese momento la página compensa los movimientos con la propia imagen, y si también siguiera al sensor corregiría dos veces. No se usa al analizar un video grabado.</p>
       <div class="fields">
         <label>Dato de la lente
           <select id="gFocalMode">
@@ -913,6 +916,7 @@ function processFrame(t) {
 
 async function start() {
   if (S.fileMode) stop();
+  if ($('autoTilt').checked && !SENS.on) enableSensor(true);
   $('startBtn').disabled = true;
   if (!window.isSecureContext) setStatus('Aviso: esta página no está en https. El navegador puede negar la cámara.');
   else setStatus('Abriendo la cámara...');
@@ -1003,7 +1007,18 @@ video.addEventListener('ended', () => {
   $('bgBtn').disabled = true;
 });
 $('stopBtn').addEventListener('click', stop);
-$('bgBtn').addEventListener('click', () => { S.warm = 0; S.tracks = []; S.prevT = 0; setStatus('Reaprendiendo el fondo.'); });
+// Reaprender fondo: la vista actual pasa a ser la referencia (útil si acomodaste el celular después de iniciar).
+// Los puntos marcados se trasladan para que sigan sobre el mismo lugar de la vía.
+$('bgBtn').addEventListener('click', () => {
+  const dx = S.offX, dy = S.offY;
+  for (const q of [...S.refPts, ...S.checkPts]) { q.x += dx; q.y += dy; }
+  resetStab();
+  S.warm = 0; S.tracks = []; S.prevT = 0;
+  const t = sensorTilt();
+  if ($('autoTilt').checked && !S.fileMode && t != null) { SENS.applied = Math.round(t * 10) / 10; $('gTilt').value = SENS.applied.toFixed(1); }
+  saveSettings(); rebuildCal();
+  setStatus('Reaprendiendo el fondo con la vista actual como referencia.');
+});
 $('res').addEventListener('change', () => {
   if (!S.running) return;
   const v = $('res').value;
@@ -1217,28 +1232,74 @@ $('fitFovBtn').addEventListener('click', () => {
 });
 
 // ================= Sensor de inclinación =================
-$('sensorBtn').addEventListener('click', async () => {
-  const msg = $('sensorMsg');
-  try {
-    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
-      const r = await DeviceMotionEvent.requestPermission();
-      if (r !== 'granted') { msg.textContent = 'Permiso de sensores negado.'; return; }
+// Lectura continua del acelerómetro (gravedad). Inclinación del eje de la cámara trasera hacia abajo:
+// asin(gz/g). En iOS la aceleración con gravedad viene con el signo contrario.
+const SENS = { on: false, g: null, last: 0, gotData: false, applied: null, timer: null };
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const IOS_SIGN = IS_IOS ? -1 : 1;
+function onMotion(ev) {
+  const a = ev.accelerationIncludingGravity;
+  if (!a || a.x == null) return;
+  const v = [a.x * IOS_SIGN, a.y * IOS_SIGN, a.z * IOS_SIGN];
+  SENS.gotData = true;
+  // Filtro paso bajo: quita las vibraciones de la mano
+  SENS.g = SENS.g ? SENS.g.map((x, i) => x + (v[i] - x) * 0.08) : v;
+  const now = performance.now();
+  if (now - SENS.last < 200) return;            // 5 actualizaciones por segundo bastan
+  SENS.last = now;
+  const [x, y, z] = SENS.g, g = Math.hypot(x, y, z);
+  if (g < 5) return;
+  const tilt = Math.asin(Math.max(-1, Math.min(1, z / g))) / RAD;
+  // Giro: ángulo de la gravedad en el plano de la pantalla respecto al eje más cercano (para nivelar)
+  const ang = Math.abs(Math.atan2(x, y)) / RAD, roll = Math.min(ang % 90, 90 - ang % 90);
+  const measuring = S.running && !S.fileMode;
+  let txt = `Sensor: inclinación ${nf(tilt, 1)}° · giro ${nf(roll, 1)}°`;
+  if (roll > 1.5) txt += ' · nivela el celular';
+  if (!measuring && !S.fileMode) {
+    if (SENS.applied == null || Math.abs(tilt - SENS.applied) >= 0.1) {
+      SENS.applied = Math.round(tilt * 10) / 10;
+      $('gTilt').value = SENS.applied.toFixed(1);
+      saveSettings(); rebuildCal();
     }
-  } catch (e) { msg.textContent = 'No se pudo pedir permiso a los sensores.'; return; }
-  if (typeof DeviceMotionEvent === 'undefined') { msg.textContent = 'Este navegador no da acceso a los sensores.'; return; }
-  msg.textContent = 'Midiendo durante 1 s. No muevas el celular...';
-  const acc = [0, 0, 0]; let n = 0;
-  const h = (ev) => { const a = ev.accelerationIncludingGravity; if (a && a.x != null) { acc[0] += a.x; acc[1] += a.y; acc[2] += a.z; n++; } };
-  window.addEventListener('devicemotion', h);
-  setTimeout(() => {
-    window.removeEventListener('devicemotion', h);
-    if (!n) { msg.textContent = 'El sensor no respondió.'; return; }
-    const [x, y, z] = acc.map((v) => v / n), g = Math.hypot(x, y, z);
-    const tilt = Math.asin(Math.max(-1, Math.min(1, z / g))) / RAD;
-    $('gTilt').value = tilt.toFixed(1);
-    msg.textContent = `Lectura: ${nf(tilt, 1)}°. Comprueba que la línea de horizonte quede donde se pierde la vía.`;
-    saveSettings(); rebuildCal();
-  }, 1000);
+  } else if (measuring) {
+    const d = tilt - num('gTilt');
+    txt += Math.abs(d) > 1.5
+      ? ` · cambió ${nf(d, 1)}°: si moviste el celular a propósito, pulsa «Reaprender fondo»`
+      : ' · fija mientras mide';
+  } else txt += ' · no se usa con videos grabados';
+  $('sensorMsg').textContent = txt;
+}
+function sensorTilt() {
+  if (!SENS.g) return null;
+  const [x, y, z] = SENS.g, g = Math.hypot(x, y, z);
+  return g < 5 ? null : Math.asin(Math.max(-1, Math.min(1, z / g))) / RAD;
+}
+async function enableSensor(fromGesture) {
+  if (typeof DeviceMotionEvent === 'undefined') { $('sensorMsg').textContent = 'Este navegador no da acceso a los sensores.'; return false; }
+  if (typeof DeviceMotionEvent.requestPermission === 'function') {
+    if (!fromGesture) { $('sensorMsg').textContent = 'Toca la casilla o «Iniciar cámara» para permitir el sensor.'; return false; }
+    try {
+      if (await DeviceMotionEvent.requestPermission() !== 'granted') { $('sensorMsg').textContent = 'Permiso de sensores negado.'; return false; }
+    } catch (e) { $('sensorMsg').textContent = 'No se pudo pedir permiso a los sensores.'; return false; }
+  }
+  if (!SENS.on) { window.addEventListener('devicemotion', onMotion); SENS.on = true; }
+  SENS.gotData = false; SENS.applied = null;
+  clearTimeout(SENS.timer);
+  SENS.timer = setTimeout(() => {
+    if (SENS.on && !SENS.gotData) $('sensorMsg').textContent = 'El sensor no entrega datos. Revisa el permiso de sensores de movimiento del sitio (en Brave, también los escudos).';
+  }, 2000);
+  $('sensorMsg').textContent = 'Leyendo el sensor...';
+  return true;
+}
+function disableSensor() {
+  window.removeEventListener('devicemotion', onMotion);
+  SENS.on = false; SENS.g = null; clearTimeout(SENS.timer);
+  $('sensorMsg').textContent = '';
+}
+$('autoTilt').addEventListener('change', async () => {
+  if ($('autoTilt').checked) { if (!(await enableSensor(true))) $('autoTilt').checked = false; }
+  else disableSensor();
+  saveSettings();
 });
 
 // ================= Registro =================
@@ -1299,7 +1360,7 @@ $('clearLog').addEventListener('click', () => {
 
 // ================= Ajustes =================
 const SETTING_IDS = ['res', 'gH', 'gTilt', 'gRoll', 'gFocalMode', 'gFov', 'gF35', 'gCrop', 'gNear', 'gFar', 'rA', 'rB', 'rExt', 'thr', 'minArea', 'minTravel', 'vMin', 'vMax', 'limit'];
-const CHECK_IDS = ['showGrid', 'shadows', 'showMask'];
+const CHECK_IDS = ['showGrid', 'shadows', 'showMask', 'autoTilt'];
 function saveSettings() {
   const o = { calMode: S.calMode, refPts: S.refPts };
   SETTING_IDS.forEach((id) => { o[id] = $(id).value; });
@@ -1382,6 +1443,7 @@ $('panelBtn').addEventListener('click', () => setPanel(ws.classList.contains('no
 try { if (localStorage.getItem('velocimetro.panel.v1') === '0') setPanel(false); } catch (e) { /* sin almacenamiento */ }
 
 loadSaved();
+if ($('autoTilt').checked) enableSensor(false);
 updateFocalFields();
 setCalMode(S.calMode);
 renderLog();
